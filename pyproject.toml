@@ -11,9 +11,11 @@ dependencies = ["torch>=2.0", "torchvision>=0.15", "numpy", "pyyaml", "medmnist>
 
 [project.optional-dependencies]
 dev = ["pytest"]
+gui = ["gradio>=4.0", "matplotlib", "pandas"]
 
 [project.scripts]
 ssfl = "ssfl.__main__:main"
+ssfl-gui = "ssfl.gui:main"
 
 [tool.setuptools.packages.find]
 include = ["ssfl*"]

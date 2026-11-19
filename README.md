@@ -32,8 +32,22 @@ ssfl/
 python -m venv .venv
 .venv\Scripts\activate          # Windows  (Linux/macOS: source .venv/bin/activate)
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-pip install -e .[dev]
+pip install -e .[dev,gui]
 ```
+
+## Graphical interface
+
+```bash
+python -m ssfl --gui          # opens http://127.0.0.1:7860
+```
+
+* **Experiment tab** — start from a preset, change any setting (dropdowns list every
+  registered dataset / strategy / aggregator, including your own plug-ins), click
+  **Preview data partition** to see the non-IID class split per client, then
+  **Run** to watch accuracy, loss and pseudo-label statistics update every round.
+  **Stop** ends the run after the current round; **Save as preset** writes `configs/<name>.yaml`.
+* **Results tab** — tick finished runs to overlay their curves and get a summary table.
+* In Colab: `from ssfl.gui import launch; launch()` shows the GUI inside the notebook.
 
 ## Run
 

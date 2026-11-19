@@ -76,3 +76,14 @@ def test_fedlabel_selection_ablation(tmp_path):
             assert hist[-1]["train_local_selected"] == 1.0
         if sel == "global":
             assert hist[-1]["train_local_selected"] == 0.0
+
+
+def test_gui_config_roundtrip_and_build():
+    pytest.importorskip("gradio")
+    from ssfl import gui
+    for preset in gui.list_presets():
+        cfg = gui.load_preset(preset)
+        assert gui.values_to_cfg(*gui.cfg_to_values(cfg)).to_dict() == cfg.to_dict()
+    assert "tau" in gui.default_params(STRATEGIES.get("fedlabel"))
+    assert "weight_by" in gui.default_params(AGGREGATORS.get("fedadam"))
+    gui.build_app()

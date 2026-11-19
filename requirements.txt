@@ -5,3 +5,6 @@ pyyaml
 medmnist>=3.0
 Pillow
 pytest
+gradio>=4.0
+matplotlib
+pandas
