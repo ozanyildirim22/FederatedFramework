@@ -1,0 +1,25 @@
+# Seconds-long sanity run on a synthetic dataset (no download, CPU is fine).
+name: quick_test
+seed: 0
+device: auto
+data:
+  dataset: synthetic
+  partitioner: dirichlet
+  alpha: 0.5
+  labeled_ratio: 0.2
+  batch_size: 16
+  unlabeled_batch_ratio: 2
+model:
+  name: simple_cnn
+  norm: gn
+  params: {width: 16}
+strategy:
+  name: fedlabel
+  local_steps: 5
+  lr: 0.05
+  params: {tau: 0.8}
+server:
+  aggregator: fedavg
+  rounds: 3
+  num_clients: 5
+  client_fraction: 0.6

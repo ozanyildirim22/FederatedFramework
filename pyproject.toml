@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ssfl"
+version = "0.1.0"
+description = "Plug-and-play Semi-Supervised Federated Learning framework"
+requires-python = ">=3.9"
+dependencies = ["torch>=2.0", "torchvision>=0.15", "numpy", "pyyaml", "medmnist>=3.0", "Pillow"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+ssfl = "ssfl.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["ssfl*"]

@@ -1,0 +1,34 @@
+# Cross-device setting: many small clients, partial participation.
+name: cifar10_fedlabel
+seed: 42
+device: auto
+data:
+  dataset: cifar10
+  root: ./data
+  partitioner: dirichlet
+  alpha: 0.5
+  labeled_ratio: 0.2          # thesis: 0.2 and 0.5
+  batch_size: 32
+  unlabeled_batch_ratio: 7
+model:
+  name: resnet18
+  norm: gn
+strategy:
+  name: fedlabel              # supervised | pseudolabel | fixmatch | fedlabel
+  local_epochs: 1
+  lr: 0.03
+  amp: false                # true = mixed precision (less VRAM, small speed-up)
+  params:
+    tau: 0.95
+    lambda_u: 1.0
+    lambda_kl: 1.0
+    temperature: 1.0
+    confidence: variance      # variance | max_prob | entropy
+    selection: adaptive       # adaptive | local | global
+    local_warmup_steps: 5
+server:
+  aggregator: fedavg
+  rounds: 200
+  num_clients: 100
+  client_fraction: 0.1
+  eval_every: 5
