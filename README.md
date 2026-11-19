@@ -26,9 +26,17 @@ ssfl/
 └── experiment.py        # wires everything + logging (metrics.csv, summary.json, model)
 ```
 
+## Google Colab
+
+Open `colab/SSFL_Colab.ipynb` in Colab
+([direct link](https://colab.research.google.com/github/ozanyildirim22/FederatedFramework/blob/main/colab/SSFL_Colab.ipynb)),
+select a GPU runtime and run the cells — it clones this repository automatically.
+
 ## Install
 
 ```bash
+git clone https://github.com/ozanyildirim22/FederatedFramework.git
+cd FederatedFramework
 python -m venv .venv
 .venv\Scripts\activate          # Windows  (Linux/macOS: source .venv/bin/activate)
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
