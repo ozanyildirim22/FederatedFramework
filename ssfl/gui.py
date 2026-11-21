@@ -953,7 +953,6 @@ def build_app():
     with gr.Blocks(title="SSFL Studio") as app:
         gr.HTML(render_hero())
         params_state = gr.State(start_params)
-        render_tick = gr.Number(0, visible=False)
 
         with gr.Tabs():
             # ======================================================== EXPERIMENT
@@ -989,25 +988,24 @@ def build_app():
                             gr.Markdown("Defaults come from the papers. Only the values you change are "
                                         "written to the config.", elem_classes="muted")
 
-                            @gr.render(inputs=[algos, params_state], triggers=[algos.change, render_tick.change,
-                                                                                app.load])
-                            def _param_forms(selected, state):
-                                if not selected:
-                                    gr.Markdown("*No algorithm selected.*")
-                                for algo in selected or []:
-                                    defaults = default_params(STRATEGIES.get(algo))
-                                    current = {**defaults, **(state or {}).get(algo, {})}
-                                    keys = [k for k in defaults] + [k for k in current
-                                                                    if k not in defaults and k != "loss_weights"]
-                                    with gr.Group(elem_classes="param-group"):
-                                        gr.HTML(f'<div class="sec-title"><b>{html.escape(algo_label(algo))}'
-                                                f'</b><span class="muted">{len(keys)} parameters</span></div>')
-                                        if not keys:
-                                            gr.Markdown("*No parameters.*")
-                                        with gr.Row(equal_height=True):
-                                            for key in keys:
-                                                _param_field(gr, algo, key, current.get(key), defaults.get(key),
-                                                             params_state)
+                            # One static form per registered algorithm, shown only when the algorithm
+                            # is ticked. (Static components are robust behind proxies such as Colab /
+                            # gradio.live; dynamically rendered forms lost edits there.)
+                            param_groups: Dict[str, Any] = {}
+                            param_fields: List[Tuple[str, str, type, Any]] = []
+                            for _, algo in algo_choices():
+                                defaults = default_params(STRATEGIES.get(algo))
+                                current = {**defaults, **start_params.get(algo, {})}
+                                with gr.Group(visible=algo in start_algos, elem_classes="param-group") as grp:
+                                    gr.HTML(f'<div class="sec-title"><b>{html.escape(algo_label(algo))}</b>'
+                                            f'<span class="muted">{len(defaults)} parameters</span></div>')
+                                    if not defaults:
+                                        gr.Markdown("*No parameters.*")
+                                    with gr.Row(equal_height=True):
+                                        for key, default in defaults.items():
+                                            comp, kind = _param_field(gr, key, current.get(key), default)
+                                            param_fields.append((algo, key, kind, comp))
+                                param_groups[algo] = grp
 
                         with gr.Accordion("🗂️  Data & augmentation", open=False):
                             with gr.Row():
@@ -1187,18 +1185,37 @@ def build_app():
             except Exception as e:  # noqa: BLE001
                 return f"# invalid configuration: {e}"
 
-        def on_preset(p, tick):
+        def param_values(state) -> List[Any]:
+            """Form values for every parameter field: the state's value, else the default."""
+            out = []
+            for algo, key, kind, _ in param_fields:
+                defaults = default_params(STRATEGIES.get(algo))
+                value = (state or {}).get(algo, {}).get(key, defaults.get(key))
+                out.append(_display_value(kind, value))
+            return out
+
+        param_comps = [f[3] for f in param_fields]
+        for algo, key, kind, comp in param_fields:
+            comp.input(_param_updater(algo, key, kind), [comp, params_state], params_state,
+                       show_progress="hidden")
+
+        def on_preset(p):
             cfg = load_preset(p)
             vals = cfg_to_values(cfg)
             vals[0] = ""                                  # auto run name
-            return (*vals, [cfg.strategy.name], {cfg.strategy.name: dict(cfg.strategy.params)},
-                    (tick or 0) + 1, render_algo_cards([cfg.strategy.name]))
+            state = {cfg.strategy.name: dict(cfg.strategy.params)}
+            return (*vals, [cfg.strategy.name], state, render_algo_cards([cfg.strategy.name]),
+                    *param_values(state))
 
         # `.input` fires only on user edits, so loading a preset keeps its tuned params.
-        preset.input(on_preset, [preset, render_tick],
-                     components + [algos, params_state, render_tick, algo_info]).then(
+        preset.input(on_preset, preset, components + [algos, params_state, algo_info] + param_comps).then(
             show_yaml, cfg_inputs, yaml_view)
-        algos.change(render_algo_cards, algos, algo_info, trigger_mode="always_last",
+
+        def on_algos(sel):
+            sel = sel or []
+            return (render_algo_cards(sel), *[gr.update(visible=a in sel) for a in param_groups])
+
+        algos.change(on_algos, algos, [algo_info] + list(param_groups.values()), trigger_mode="always_last",
                      show_progress="hidden").then(show_yaml, cfg_inputs, yaml_view)
         aggregator.input(lambda a: json.dumps(default_params(AGGREGATORS.get(a)), indent=2),
                          aggregator, server_params).then(show_yaml, cfg_inputs, yaml_view)
@@ -1414,8 +1431,14 @@ def build_app():
     return app
 
 
-def _param_field(gr, algo: str, key: str, value: Any, default: Any, params_state) -> None:
-    """One form field for an algorithm parameter; edits are written into ``params_state``."""
+def _display_value(kind: type, value: Any) -> Any:
+    if kind in (bool, int, float, str):
+        return value
+    return "" if value is None else json.dumps(value)          # JSON text field
+
+
+def _param_field(gr, key: str, value: Any, default: Any):
+    """One form field for an algorithm parameter. Returns ``(component, kind)``."""
     help_text, choices = PARAM_HELP.get(key, ("", None))
     info = help_text + (f" (default {default})" if default is not None and not isinstance(default, bool) else "")
     kind = type(default if default is not None else value)
@@ -1430,8 +1453,12 @@ def _param_field(gr, algo: str, key: str, value: Any, default: Any, params_state
     elif kind is str:
         comp = gr.Textbox(value, label=key, info=info, min_width=200)
     else:                                      # None / list / dict -> JSON
-        comp = gr.Textbox("" if value is None else json.dumps(value), label=key, info=info + " — JSON",
-                          min_width=240)
+        comp = gr.Textbox(_display_value(kind, value), label=key, info=info + " — JSON", min_width=240)
+    return comp, kind
+
+
+def _param_updater(algo: str, key: str, kind: type):
+    """Event handler that writes one edited parameter into the parameter state."""
 
     def update(new, state, algo=algo, key=key, kind=kind):
         state = copy.deepcopy(state or {})
@@ -1451,7 +1478,7 @@ def _param_field(gr, algo: str, key: str, value: Any, default: Any, params_state
             p[key] = int(new) if kind is int else new
         return state
 
-    comp.input(update, [comp, params_state], params_state)
+    return update
 
 
 def launch(**kwargs):

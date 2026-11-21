@@ -50,6 +50,7 @@ class Strategy:
         self.prox_mu: float = float(getattr(cfg, "prox_mu", 0.0) or 0.0)
         self.round: int = 0          # current communication round (1-based), set by the server hook
         self.step: int = 0           # current local step within the round
+        self.total_steps: int = 0    # local steps in the current round
 
     # ---------------------------------------------------------- server hooks
     # Some algorithms (FedMatch, FedTriNet) have a server-side part. In the
@@ -130,6 +131,7 @@ class Strategy:
 
         sums: Dict[str, float] = defaultdict(float)
         steps = self.num_steps(client)
+        self.total_steps = steps
         for step in range(steps):
             self.step = step
             labeled = self._to_device(next(lab_it)) if lab_it else None

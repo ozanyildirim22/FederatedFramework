@@ -45,6 +45,8 @@ Implementation choices (not fixed by the paper)
   plus the first residual stage of ``resnet18``. Other models use the first
   ``global_fraction`` of parameter tensors.
 * A client seen for the first time has no ``l^k`` yet; ``G`` is used instead.
+* ``finetune_steps`` is capped at half of the round's local steps, so short
+  rounds still contain pseudo-labeling steps.
 * ``unsup_view``: the input the pseudo-label loss is applied to. ``"weak"``
   (default) follows the paper; ``"strong"`` gives FixMatch-style consistency.
 * Local models are stored in float16 on the CPU (``store_dtype``) to keep
@@ -214,7 +216,9 @@ class FedTriNet(Strategy):
 
     def compute_loss(self, model, labeled, unlabeled):
         x, y = labeled if labeled is not None else (None, None)
-        if not self.phase2 or unlabeled is None or (self.step < self.finetune_steps and x is not None):
+        # fine-tune at most half of the round, so short rounds still pseudo-label
+        finetune = min(self.finetune_steps, self.total_steps // 2)
+        if not self.phase2 or unlabeled is None or (self.step < finetune and x is not None):
             if x is None:
                 raise RuntimeError("FedTriNet needs labeled data on the client")
             return self.loss(sup=supervised_ce(model(x), y))
