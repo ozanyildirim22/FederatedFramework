@@ -52,6 +52,8 @@ class Experiment:
 
         # Tier 1 - data
         self.data = DataManager(cfg.data, cfg.server.num_clients, seed=cfg.seed)
+        self.data.set_device(self.device)
+        self.num_workers = self.data.resolve_workers(cfg.strategy.local_steps, cfg.strategy.local_epochs)
         # Tier 2 - clients + strategy
         self.clients = [Client(self.data.client_data(i)) for i in range(cfg.server.num_clients)]
         self.strategy = STRATEGIES.build(cfg.strategy.name, cfg.strategy,
@@ -62,6 +64,7 @@ class Experiment:
         aggregator = AGGREGATORS.build(cfg.server.aggregator, **cfg.server.params)
         self.server = Server(self.model, aggregator, self.clients, cfg.server.client_fraction,
                              self.device, seed=cfg.seed)
+        self.server.precision = self.strategy.precision(self.device)
         self.test_loader = self.data.test_loader()
         self.strategy.setup(self)
         self.history: List[Dict[str, float]] = []
@@ -108,7 +111,10 @@ class Experiment:
         self.cfg.save(self.out_dir / "config.yaml")
         self.log(f"[ssfl] {self.data.summary()}")
         self.log(f"[ssfl] strategy={self.cfg.strategy.name} aggregator={self.cfg.server.aggregator} "
-                 f"model={self.cfg.model.name} device={self.device} -> {self.out_dir}")
+                 f"model={self.cfg.model.name} device={self.device} "
+                 f"workers={self.num_workers}{' (auto)' if self.cfg.data.num_workers < 0 else ''} "
+                 f"augment={self.cfg.data.augment_device} precision={self.server.precision} "
+                 f"-> {self.out_dir}")
 
         for rnd in range(1, self.cfg.server.rounds + 1):
             rec = self.run_round(rnd)

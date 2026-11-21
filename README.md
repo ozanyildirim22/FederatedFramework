@@ -66,7 +66,7 @@ python -m ssfl --gui          # opens http://127.0.0.1:7860
   (best accuracy per algorithm × dataset × label ratio) with CSV and LaTeX download.
 * **📘 Guide** — what every algorithm does and how to use the studio.
 * In Colab, run the notebook's GUI cell:
-  `!python -m ssfl --gui --share --data-dir "{DATA_DIR}" --runs-dir "{RUNS_DIR}" --workers 2`.
+  `!python -m ssfl --gui --share --data-dir "{DATA_DIR}" --runs-dir "{RUNS_DIR}"`.
   It starts the GUI as a fresh process (always the latest cloned code) and prints a public
   `gradio.live` link. The **build** chip in the header shows the git commit the GUI runs.
 
@@ -97,7 +97,7 @@ python -m ssfl -c configs/cifar10_fedlabel.yaml --set strategy.prox_mu=0.01     
 ```bash
 python -m ssfl --grid configs/grids/thesis.yaml --dry-run              # list the runs
 python -m ssfl --grid configs/grids/thesis.yaml --only organamnist     # run a subset
-python -m ssfl --grid configs/grids/thesis.yaml --set data.num_workers=2
+python -m ssfl --grid configs/grids/thesis.yaml --set output_dir=/content/drive/MyDrive/ssfl/runs
 ```
 
 A run whose `runs/<name>_*/summary.json` already exists is skipped, so an interrupted grid
@@ -190,9 +190,31 @@ for `DATASETS`, `PARTITIONERS` and `MODELS`. See `examples/custom_algorithm.py`.
   needs ~1.6 s per step on an RTX 3050 Laptop GPU (≈4 min per cross-silo round).
 * Faster iteration while developing: `--set model.name=simple_cnn` or
   `data.unlabeled_batch_ratio=3`, fewer `server.rounds`.
-* `data.num_workers > 0` moves augmentation off the main process.
+* `data.num_workers` (default `-1` = auto) runs augmentation in background processes.
+  Auto uses 0 on Windows (starting a worker costs seconds there) and for small rounds such
+  as the quick demo, and up to 4 on Colab / Linux with real datasets. Workers start once per
+  client per round, so for tiny rounds they cost more than they save.
 * `strategy.grad_clip` (default 5.0) and zero-initialised residual branches keep
-  early training stable; `strategy.amp=true` enables mixed precision.
+  early training stable.
+
+### Large GPUs (A100 / H100 / RTX PRO class)
+
+On a large GPU the training step itself is fast, so the CPU becomes the bottleneck. It decodes
+and augments ~480 images per step, about 0.35-0.5 s per step for one process. Two options move
+that work to the GPU (**⚡ Fast GPU mode** in the GUI turns on both):
+
+| Setting | What it does |
+|---|---|
+| `data.augment_device=gpu` | Keeps the dataset on the GPU (OrganAMNIST 27 MB, CIFAR-10 150 MB) and augments whole batches there: flip + reflect crop, RandAugment with torchvision's own ops and magnitudes, Cutout. About 40 ms per step instead of about 350 ms of CPU work on an RTX 3050 Laptop. Statistically the same views as the CPU pipeline, but not bit-identical: keep `cpu` to reproduce earlier runs. |
+| `strategy.precision=bf16` | bfloat16 autocast. It has the float32 range, so no loss scaling is needed (fp16, the old `amp`, made training diverge). Needs hardware bf16 (Ampere or newer); elsewhere it falls back to fp32. About 20% faster on an RTX 3050 Laptop. |
+| `strategy.channels_last=true` | NHWC memory layout for convolutions (optional). |
+
+On small GPUs (T4, laptops) the GPU itself is the bottleneck. CPU augmentation of the next batch
+already overlaps with training, so `augment_device=gpu` gains little there and can even be slower.
+
+```bash
+python -m ssfl -c configs/organamnist_fedlabel.yaml --set data.augment_device=gpu strategy.precision=bf16
+```
 
 ## Tests
 

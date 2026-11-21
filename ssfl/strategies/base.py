@@ -33,6 +33,33 @@ def _cycle(loader) -> Iterator:
             yield batch
 
 
+def _native_bf16() -> bool:
+    """bf16 in hardware (Ampere / compute capability 8.0 and newer), not emulated."""
+    try:
+        return torch.cuda.is_bf16_supported(including_emulation=False)
+    except TypeError:                                # older PyTorch: no emulation flag
+        return torch.cuda.is_bf16_supported() and torch.cuda.get_device_capability()[0] >= 8
+
+
+def round_batches(loader, steps: int) -> Iterator:
+    """Exactly ``steps`` shuffled batches from ``loader`` for one local round.
+
+    Without worker processes this simply cycles the loader. With workers, cycling
+    would start a fresh set of worker processes every time the loader runs out,
+    and a client's labeled set is often only a few batches long, so a round
+    started them many times. Here one loader covers the whole round, re-shuffling
+    after every pass over the data, so its workers start once per round.
+    """
+    if loader.num_workers == 0:
+        return _cycle(loader)
+    from torch.utils.data import DataLoader, RandomSampler
+
+    ds, bs = loader.dataset, loader.batch_size
+    sampler = RandomSampler(ds, replacement=False, num_samples=steps * bs)  # repeats permutations
+    return iter(DataLoader(ds, batch_size=bs, sampler=sampler, num_workers=loader.num_workers,
+                           pin_memory=loader.pin_memory, drop_last=False))
+
+
 class Strategy:
     #: does the strategy consume the unlabeled loader?
     uses_unlabeled: bool = True
@@ -51,6 +78,7 @@ class Strategy:
         self.round: int = 0          # current communication round (1-based), set by the server hook
         self.step: int = 0           # current local step within the round
         self.total_steps: int = 0    # local steps in the current round
+        self._channels_last = False
 
     # ---------------------------------------------------------- server hooks
     # Some algorithms (FedMatch, FedTriNet) have a server-side part. In the
@@ -108,10 +136,35 @@ class Strategy:
     def _to_device(self, batch):
         if batch is None:
             return None
-        return tuple(t.to(self.device, non_blocking=True) if torch.is_tensor(t) else t for t in batch)
+        out = []
+        for t in batch:
+            if torch.is_tensor(t):
+                t = t.to(self.device, non_blocking=True)
+                if self._channels_last and t.dim() == 4:
+                    t = t.contiguous(memory_format=torch.channels_last)
+            out.append(t)
+        return tuple(out)
+
+    # ------------------------------------------------------------ precision
+    def precision(self, device: torch.device) -> str:
+        """Effective precision: ``fp32`` | ``bf16`` | ``fp16`` (``amp: true`` = fp16).
+        bf16 on a GPU without bf16 support and fp16 on the CPU fall back to fp32."""
+        p = str(getattr(self.cfg, "precision", "fp32") or "fp32").lower()
+        if p == "fp32" and getattr(self.cfg, "amp", False):
+            p = "fp16"
+        if p not in ("fp32", "bf16", "fp16"):
+            raise ValueError(f"Unknown precision '{p}' (fp32 | bf16 | fp16)")
+        if p == "fp16" and device.type != "cuda":
+            return "fp32"
+        if p == "bf16" and device.type == "cuda" and not _native_bf16():
+            return "fp32"            # e.g. T4: bf16 would only be emulated (slower than fp32)
+        return p
 
     def local_train(self, model: nn.Module, client, device: torch.device) -> Dict[str, float]:
         self.device = device
+        self._channels_last = bool(getattr(self.cfg, "channels_last", False)) and device.type == "cuda"
+        if self._channels_last:
+            model.to(memory_format=torch.channels_last)
         if self.needs_global_model:
             self.global_model = copy.deepcopy(model).eval()
             for p in self.global_model.parameters():
@@ -122,26 +175,31 @@ class Strategy:
         self.on_round_start(model, client)
         model.train()
         opt = self.make_optimizer(model)
-        lab_it = _cycle(client.data.labeled) if client.data.labeled is not None else None
-        unl_it = (_cycle(client.data.unlabeled)
-                  if self.uses_unlabeled and client.data.unlabeled is not None else None)
-
-        use_amp = bool(getattr(self.cfg, "amp", False)) and device.type == "cuda"
-        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-
-        sums: Dict[str, float] = defaultdict(float)
         steps = self.num_steps(client)
         self.total_steps = steps
+        lab_it = round_batches(client.data.labeled, steps) if client.data.labeled is not None else None
+        unl_it = (round_batches(client.data.unlabeled, steps)
+                  if self.uses_unlabeled and client.data.unlabeled is not None else None)
+
+        # bf16 has the float32 range, so it needs no loss scaling; fp16 does
+        prec = self.precision(device)
+        use_amp = prec != "fp32"
+        amp_dtype = torch.bfloat16 if prec == "bf16" else torch.float16
+        scaler = torch.amp.GradScaler("cuda", enabled=prec == "fp16")
+
+        # logged values stay on the device during the round (a float() per value per
+        # step would make the CPU wait for the GPU every step); converted once at the end
+        sums: Dict[str, object] = defaultdict(float)
         for step in range(steps):
             self.step = step
             labeled = self._to_device(next(lab_it)) if lab_it else None
             unlabeled = self._to_device(next(unl_it)) if unl_it else None
-            with torch.autocast(device.type, enabled=use_amp):
+            with torch.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
                 loss, logs = self.compute_loss(model, labeled, unlabeled)
             prox = self.proximal_term(model)
             if prox is not None:
                 loss = loss + prox
-                logs["loss_prox"] = float(prox.detach())
+                logs["loss_prox"] = prox.detach()
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             if self.cfg.grad_clip:
@@ -150,8 +208,13 @@ class Strategy:
             scaler.step(opt)
             scaler.update()
             for k, v in logs.items():
-                sums[k] += v
+                sums[k] = sums[k] + (v.detach().float() if torch.is_tensor(v) else v)
 
         self.on_round_end(model, client)
         self.global_model, self._global_params = None, None
-        return {k: v / steps for k, v in sums.items()}
+        out = {k: float(v) for k, v in sums.items()}
+        correct, count = out.pop("_pl_correct", None), out.pop("_pl_count", None)
+        metrics = {k: v / steps for k, v in out.items()}
+        if count:                                     # accuracy over all pseudo-labeled samples
+            metrics["pl_acc"] = correct / count
+        return metrics

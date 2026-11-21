@@ -21,8 +21,9 @@ class DataConfig:
     labeled_ratio: float = 0.2          # fraction of each client's data that keeps its labels
     batch_size: int = 64                # labeled batch size
     unlabeled_batch_ratio: int = 7      # unlabeled batch = ratio * batch_size (FixMatch "mu")
-    num_workers: int = 0
+    num_workers: int = -1               # DataLoader workers; -1 = auto (0 on Windows / small rounds)
     strong_aug: str = "randaugment"     # randaugment | none
+    augment_device: str = "cpu"         # cpu (PIL, exact) | gpu (dataset on the GPU, batched augmentation)
     randaugment_n: int = 2
     randaugment_m: int = 10
 
@@ -45,7 +46,9 @@ class StrategyConfig:
     momentum: float = 0.9
     weight_decay: float = 5e-4
     prox_mu: float = 0.0                # > 0 adds a FedProx proximal term to any strategy
-    amp: bool = False                   # mixed-precision training on CUDA (saves VRAM)
+    amp: bool = False                   # legacy switch: true = precision fp16
+    precision: str = "fp32"             # fp32 | bf16 (fast on Ampere+ GPUs, no loss scaling) | fp16
+    channels_last: bool = False         # NHWC memory layout for convolutions (CUDA only)
     grad_clip: Optional[float] = 5.0    # max gradient L2 norm (None disables)
     params: Dict[str, Any] = field(default_factory=dict)  # strategy-specific kwargs
 

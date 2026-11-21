@@ -42,11 +42,17 @@ class Server:
     def evaluate(self, loader) -> Dict[str, float]:
         self.model.load_state_dict(self.global_state)
         self.model.to(self.device).eval()
-        correct, total, loss = 0, 0, 0.0
+        prec = getattr(self, "precision", "fp32")      # set by Experiment from the strategy
+        dtype = torch.bfloat16 if prec == "bf16" else torch.float16
+        correct = torch.zeros((), device=self.device)
+        loss = torch.zeros((), device=self.device)
+        total = 0
         for x, y in loader:
             x, y = x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
-            logits = self.model(x)
-            loss += nn.functional.cross_entropy(logits, y, reduction="sum").item()
-            correct += (logits.argmax(1) == y).sum().item()
+            with torch.autocast(self.device.type, dtype=dtype, enabled=prec != "fp32"):
+                logits = self.model(x)
+            logits = logits.float()
+            loss += nn.functional.cross_entropy(logits, y, reduction="sum")
+            correct += (logits.argmax(1) == y).sum()
             total += y.numel()
-        return {"test_acc": correct / total, "test_loss": loss / total}
+        return {"test_acc": float(correct) / total, "test_loss": float(loss) / total}

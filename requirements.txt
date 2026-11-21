@@ -8,3 +8,4 @@ pytest
 gradio>=4.0
 matplotlib
 pandas
+nvidia-ml-py

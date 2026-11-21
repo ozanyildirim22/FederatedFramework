@@ -175,11 +175,11 @@ FIELDS = [
     "name", "seed", "device", "output_dir",
     "data.dataset", "data.root", "data.image_size", "data.partitioner", "data.alpha",
     "data.labeled_ratio", "data.batch_size", "data.unlabeled_batch_ratio", "data.num_workers",
-    "data.strong_aug",
+    "data.strong_aug", "data.augment_device",
     "model.name", "model.norm", "model.params",
     "strategy.local_epochs", "strategy.local_steps", "strategy.optimizer",
     "strategy.lr", "strategy.momentum", "strategy.weight_decay", "strategy.prox_mu",
-    "strategy.grad_clip", "strategy.amp",
+    "strategy.grad_clip", "strategy.precision", "strategy.channels_last",
     "server.aggregator", "server.rounds", "server.num_clients", "server.client_fraction",
     "server.eval_every", "server.params",
 ]
@@ -410,7 +410,10 @@ class RunController:
                     self.version += 1
                 self._log(exp.data.summary())
                 self._log(f"strategy={run['cfg'].strategy.name} aggregator={run['cfg'].server.aggregator} "
-                          f"model={run['cfg'].model.name} device={exp.device} -> {exp.out_dir}")
+                          f"model={run['cfg'].model.name} device={exp.device} "
+                          f"workers={exp.num_workers}{' (auto)' if run['cfg'].data.num_workers < 0 else ''} "
+                          f"augment={run['cfg'].data.augment_device} precision={exp.server.precision} "
+                          f"-> {exp.out_dir}")
                 exp.run()
                 with self.lock:
                     run["status"], run["ended"] = "done", time.time()
@@ -514,6 +517,8 @@ def render_status(snap) -> str:
                     else "")
     if eta is not None:
         foot.append(f"ETA {_fmt_secs(eta)}")
+    if state in ("running", "stopping"):
+        foot.append(gpu_usage())
     chips = ""
     if 1 < len(active) and snap["kind"] == "experiment":     # the grid tab has its own table
         chips = '<div class="queue">' + "".join(
@@ -1041,6 +1046,30 @@ footer { display:none !important; }
 """
 
 
+FAST_MODE = {"data.augment_device": "gpu", "strategy.precision": "bf16"}
+
+
+def _is_fast(values: Dict[str, Any]) -> bool:
+    return all(values.get(k) == val for k, val in FAST_MODE.items())
+
+
+def gpu_usage() -> str:
+    """"GPU 63% · 5.1/96 GB" for the status bar (utilisation needs nvidia-ml-py; omitted without it)."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return ""
+        free, total = torch.cuda.mem_get_info()
+        text = f"{(total - free) / 2**30:.1f}/{total / 2**30:.0f} GB"
+        try:
+            text = f"{torch.cuda.utilization()}% · " + text
+        except Exception:  # noqa: BLE001 - pynvml missing
+            pass
+        return "GPU " + text
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _section(n: str, title: str, hint: str = "") -> str:
     return (f'<div class="sec-title"><div class="n">{n}</div><b>{title}</b>'
             + (f'<span class="muted">{hint}</span>' if hint else "") + "</div>")
@@ -1093,6 +1122,12 @@ def build_app():
                                                         minimum=1)
                                 client_fraction = gr.Slider(0.01, 1.0, value=v["server.client_fraction"],
                                                             step=0.01, label="Clients per round C")
+                            fast = gr.Checkbox(
+                                _is_fast(v), label="⚡ Fast GPU mode",
+                                info="Augmentation on the GPU + bf16 precision, for large GPUs (A100 / H100 / "
+                                     "RTX PRO class), where CPU augmentation is the bottleneck. On small GPUs "
+                                     "(T4, laptops) it gains little. Same augmentations, but not bit-identical "
+                                     "to the CPU pipeline: keep it off to reproduce earlier runs.")
                         with gr.Accordion("🎛️  Algorithm parameters", open=False):
                             gr.Markdown("Defaults come from the papers. Only the values you change are "
                                         "written to the config.", elem_classes="muted")
@@ -1128,10 +1163,15 @@ def build_app():
                                 unl_ratio = gr.Number(v["data.unlabeled_batch_ratio"], precision=0,
                                                       label="Unlabeled batch ratio μ")
                                 num_workers = gr.Number(v["data.num_workers"], precision=0,
-                                                        label="DataLoader workers", info="2 on Colab / Linux")
+                                                        label="DataLoader workers", minimum=-1,
+                                                        info="-1 = auto: 0 on Windows or for small rounds "
+                                                             "(quick demo), up to 4 on Colab / Linux")
                             with gr.Row():
                                 strong_aug = gr.Dropdown(["randaugment", "none"], value=v["data.strong_aug"],
                                                          label="Strong augmentation")
+                                augment_device = gr.Dropdown(["cpu", "gpu"], value=v["data.augment_device"],
+                                                             label="Augmentation on",
+                                                             info="gpu: dataset kept on the GPU, batched")
                                 root = gr.Textbox(v["data.root"], label="Download folder")
                         with gr.Accordion("🧠  Model & local training", open=False):
                             with gr.Row():
@@ -1154,7 +1194,12 @@ def build_app():
                             with gr.Row():
                                 prox_mu = gr.Number(v["strategy.prox_mu"], label="Extra FedProx μ",
                                                     info="adds a proximal term to any algorithm")
-                                amp = gr.Checkbox(v["strategy.amp"], label="Mixed precision (AMP)")
+                            with gr.Row():
+                                precision = gr.Dropdown(["fp32", "bf16", "fp16"], value=v["strategy.precision"],
+                                                        label="Precision",
+                                                        info="bf16: faster on modern GPUs, no loss scaling")
+                                channels_last = gr.Checkbox(v["strategy.channels_last"], label="channels_last",
+                                                            info="NHWC memory layout for convolutions")
                             model_params = gr.Code(v["model.params"], language="json",
                                                    label="Model parameters (JSON)", lines=2)
                         with gr.Accordion("🖥️  Server & run", open=False):
@@ -1232,7 +1277,7 @@ def build_app():
                                                              ("num_workers", "data.num_workers"))
                         if ENV_DEFAULTS.get(e) not in (None, ""))
                     grid_extra = gr.Textbox(env_extra, label="Extra overrides", scale=3,
-                                            placeholder="e.g. data.num_workers=2 output_dir=/content/drive/MyDrive/ssfl/runs")
+                                            placeholder="e.g. server.rounds=50 output_dir=/content/drive/MyDrive/ssfl/runs")
                     grid_skip = gr.Checkbox(True, label="Skip finished", scale=1)
                 with gr.Row():
                     grid_preview_btn = gr.Button("🔍  Preview runs", scale=1)
@@ -1283,10 +1328,10 @@ def build_app():
         # ============================================================ wiring
         components = [name, seed, device, output_dir,
                       dataset, root, image_size, partitioner, alpha, labeled_ratio, batch_size,
-                      unl_ratio, num_workers, strong_aug,
+                      unl_ratio, num_workers, strong_aug, augment_device,
                       model_name, norm, model_params,
                       local_epochs, local_steps, optimizer, lr, momentum, weight_decay,
-                      prox_mu, grad_clip, amp,
+                      prox_mu, grad_clip, precision, channels_last,
                       aggregator, rounds, num_clients, client_fraction, eval_every, server_params]
         assert len(components) == len(FIELDS)
         cfg_inputs = components + [algos, params_state]
@@ -1326,12 +1371,19 @@ def build_app():
             vals[0] = ""                                  # auto run name
             state = {cfg.strategy.name: dict(cfg.strategy.params)}
             return (*vals, [cfg.strategy.name], state, render_algo_cards([cfg.strategy.name]),
-                    *param_values(state))
+                    _is_fast(dict(zip(FIELDS, vals))), *param_values(state))
 
         # `.input` fires only on user edits, so loading a preset keeps its tuned params.
-        preset.input(on_preset, preset, components + [algos, params_state, algo_info] + param_comps,
+        preset.input(on_preset, preset, components + [algos, params_state, algo_info, fast] + param_comps,
                      concurrency_limit=1, concurrency_id="param-state").then(
             show_yaml, cfg_inputs, yaml_view)
+
+        # fast GPU mode <-> the two fields it sets
+        fast.input(lambda on: ("gpu", "bf16") if on else ("cpu", "fp32"), fast,
+                   [augment_device, precision]).then(show_yaml, cfg_inputs, yaml_view)
+        for comp in (augment_device, precision):
+            comp.input(lambda a, p: _is_fast({"data.augment_device": a, "strategy.precision": p}),
+                       [augment_device, precision], fast)
 
         def on_algos(sel):
             sel = sel or []

@@ -19,12 +19,12 @@ def _forward_cat(model, *xs):
     return list(logits.split([x.shape[0] for x in xs]))
 
 
-def _pl_stats(pseudo, mask, true) -> Dict[str, float]:
+def _pl_stats(pseudo, mask, true) -> Dict[str, torch.Tensor]:
+    """Pseudo-label diagnostics, kept on the device (no GPU sync per step).
+    ``Strategy.local_train`` turns ``_pl_correct`` / ``_pl_count`` into ``pl_acc``:
+    the accuracy over all pseudo-labeled samples of the round."""
     m = mask.float()
-    out = {"mask_rate": float(m.mean())}
-    if m.sum() > 0:
-        out["pl_acc"] = float(((pseudo == true).float() * m).sum() / m.sum())
-    return out
+    return {"mask_rate": m.mean(), "_pl_correct": ((pseudo == true).float() * m).sum(), "_pl_count": m.sum()}
 
 
 def confidence_score(probs: torch.Tensor, kind: str) -> torch.Tensor:
@@ -177,6 +177,6 @@ class FedLabel(Strategy):
         terms["unsup"] = masked_ce(ls, pseudo, mask)
         terms["kl"] = kl_consistency(lw, g_logits, self.temperature)
         logs.update(_pl_stats(pseudo, mask, u_true))
-        logs["local_selected"] = float(use_local.float().mean())
+        logs["local_selected"] = use_local.float().mean()
         total, l = self.loss(**terms)
         return total, {**l, **logs}

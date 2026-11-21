@@ -245,7 +245,7 @@ class FedMatch(Strategy):
             terms["unsup"] = masked_ce(ls, pseudo, mask)
             if h_logits:
                 terms["iccs"] = sum(kl_consistency(lw, hl) for hl in h_logits) / len(h_logits)
-                logs["helper_agree"] = float((pseudo == local_cls).float().mean())
+                logs["helper_agree"] = (pseudo == local_cls).float().mean()
             logs["num_helpers"] = float(len(h_logits))
             logs.update(_pl_stats(pseudo, mask, u_true))
             if isinstance(model, DecomposedModel):

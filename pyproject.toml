@@ -11,7 +11,7 @@ dependencies = ["torch>=2.0", "torchvision>=0.15", "numpy", "pyyaml", "medmnist>
 
 [project.optional-dependencies]
 dev = ["pytest"]
-gui = ["gradio>=4.0", "matplotlib", "pandas"]
+gui = ["gradio>=4.0", "matplotlib", "pandas", "nvidia-ml-py"]
 
 [project.scripts]
 ssfl = "ssfl.__main__:main"

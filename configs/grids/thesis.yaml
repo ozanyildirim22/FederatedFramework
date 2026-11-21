@@ -2,7 +2,7 @@
 #   python -m ssfl --grid configs/grids/thesis.yaml --dry-run
 #   python -m ssfl --grid configs/grids/thesis.yaml --only organamnist
 # Finished runs (runs/<name>_*/summary.json) are skipped, so the grid can be resumed.
-# Extra --set overrides apply to every run, e.g. --set data.num_workers=2 output_dir=/content/drive/MyDrive/ssfl/runs
+# Extra --set overrides apply to every run, e.g. --set output_dir=/content/drive/MyDrive/ssfl/runs
 
 algorithms:
   fedavg: {}                         # labeled data only

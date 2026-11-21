@@ -49,8 +49,8 @@ class CompositeLoss:
             if w == 0:
                 continue
             total = w * value if total is None else total + w * value
-            logs[f"loss_{name}"] = float(value.detach())
+            logs[f"loss_{name}"] = value.detach()      # tensors: converted once per round
         if total is None:
             raise ValueError("CompositeLoss received no active terms")
-        logs["loss"] = float(total.detach())
+        logs["loss"] = total.detach()
         return total, logs

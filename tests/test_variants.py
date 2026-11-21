@@ -181,10 +181,85 @@ def test_gui_env_defaults_and_version():
     assert gui.code_version()
 
 
-def test_same_name_same_second_gets_its_own_folder(tmp_path):
+def test_same_name_same_second_gets_its_own_folder(tmp_path, monkeypatch):
+    import ssfl.experiment
+    monkeypatch.setattr(ssfl.experiment.time, "strftime", lambda fmt: "20260101-120000")  # same second
     cfg = cfg_for(tmp_path, **{"strategy.name": "fedavg", "server.rounds": 1})
     first = Experiment(cfg, verbose=False)
     first.out_dir.mkdir(parents=True)                        # as if it had just started
     second = Experiment(cfg, verbose=False)
     assert second.out_dir != first.out_dir
     assert second.out_dir.name.startswith(first.out_dir.name)
+
+
+def test_auto_num_workers(monkeypatch):
+    import numpy as np
+    import sys
+    from ssfl.data import manager
+    tiny = [(np.arange(80), np.arange(320))] * 3                      # quick demo: few small batches
+    big = [(np.arange(170), np.arange(3200))] * 10                    # OrganAMNIST-like client
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr("os.cpu_count", lambda: 2)
+    assert manager.auto_num_workers(tiny, 16, 2, local_steps=5, local_epochs=1) == 0
+    assert manager.auto_num_workers(big, 32, 7, local_steps=None, local_epochs=1) == 2
+    monkeypatch.setattr(sys, "platform", "win32")
+    assert manager.auto_num_workers(big, 32, 7, local_steps=None, local_epochs=1) == 0
+
+
+def test_round_batches_with_workers_gives_exact_steps():
+    from torch.utils.data import DataLoader, TensorDataset
+    from ssfl.strategies.base import round_batches
+    loader = DataLoader(TensorDataset(torch.arange(10)), batch_size=4, shuffle=True, num_workers=1)
+    batches = list(round_batches(loader, steps=5))                    # one worker start for 2 passes
+    assert len(batches) == 5 and all(len(b[0]) == 4 for b in batches)
+    seen = torch.cat([b[0] for b in batches])
+    assert torch.bincount(seen, minlength=10).tolist() == [2] * 10    # every sample twice, reshuffled
+
+
+def test_experiment_runs_with_worker_processes(tmp_path):
+    cfg = cfg_for(tmp_path, **{"strategy.name": "fedlabel", "data.num_workers": 1, "server.rounds": 1,
+                               "strategy.local_steps": 3, "server.num_clients": 2})
+    exp = Experiment(cfg, verbose=False)
+    assert exp.num_workers == 1 and exp.clients[0].data.unlabeled.num_workers == 1
+    assert len(exp.run()) == 1
+
+
+# ------------------------------------------------------------- GPU data pipeline / precision
+@pytest.mark.parametrize("strategy", ["fedlabel", "fedmatch", "fedtrinet", "fedavg"])
+def test_gpu_augmentation_pipeline_runs(tmp_path, strategy):
+    """augment_device=gpu also works on a CPU device (batched tensor augmentation)."""
+    params = {"pretrain_rounds": 1, "finetune_steps": 1} if strategy == "fedtrinet" else {}
+    hist = run(cfg_for(tmp_path, **{"strategy.name": strategy, "strategy.params": params,
+                                    "data.augment_device": "gpu"}))
+    if strategy != "fedavg":
+        assert 0.0 <= hist[-1]["train_mask_rate"] <= 1.0
+    if "train_pl_acc" in hist[-1]:
+        assert 0.0 <= hist[-1]["train_pl_acc"] <= 1.0
+
+
+def test_gpu_augment_views_match_cpu_definition():
+    import torchvision.transforms.functional as TF
+    from ssfl.data.gpu import GPUAugment, _reflect
+    img = torch.arange(3 * 8 * 8, dtype=torch.uint8).view(1, 3, 8, 8)
+    for oy, ox in [(-2, 1), (0, 0), (2, -2)]:               # crop == reflect pad + crop
+        ref = TF.crop(TF.pad(img.float(), [2, 2, 2, 2], padding_mode="reflect"), oy + 2, ox + 2, 8, 8)
+        mine = img[0][:, _reflect(oy + torch.arange(8), 8)][:, :, _reflect(ox + torch.arange(8), 8)]
+        assert torch.equal(ref[0].to(torch.uint8), mine)
+    aug = GPUAugment(32, (0.5, 0.5, 0.5), (0.25, 0.25, 0.25))
+    x = torch.randint(0, 256, (64, 3, 32, 32), dtype=torch.uint8)
+    s = aug.strong_view(x)
+    assert s.shape == (64, 3, 32, 32) and s.dtype == torch.float32
+    erased = (aug.cutout(torch.ones(256, 3, 32, 32)) == 0).all(1).float().mean((1, 2))
+    assert erased.min() >= 0.01 and erased.max() <= 0.16          # RandomErasing scale (0.02, 0.15)
+    assert aug.randaugment(x).dtype == torch.uint8
+
+
+def test_precision_options(tmp_path):
+    hist = run(cfg_for(tmp_path, **{"strategy.name": "fedlabel", "strategy.precision": "bf16",
+                                    "strategy.channels_last": True}))    # bf16 autocast on CPU
+    assert len(hist) == 3
+    s = STRATEGIES.build("fedavg", cfg_for(tmp_path, **{"strategy.precision": "fp16"}).strategy, 10)
+    assert s.precision(torch.device("cpu")) == "fp32"                      # fp16 needs CUDA
+    with pytest.raises(ValueError):
+        STRATEGIES.build("fedavg", cfg_for(tmp_path, **{"strategy.precision": "int8"}).strategy, 10
+                         ).precision(torch.device("cpu"))

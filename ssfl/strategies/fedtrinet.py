@@ -166,6 +166,11 @@ class FedTriNet(Strategy):
         loader = client.data.unlabeled
         if loader is None:
             return None
+        if hasattr(loader, "weak_only"):              # GPU pipeline (data.augment_device: gpu)
+            best = 0.0
+            for u_w in loader.weak_only(256):
+                best = max(best, float(F.softmax(model(u_w), 1).max()))
+            return best
         ds = loader.dataset
         # weak view only: skips the (expensive) strong augmentation of the training loader
         weak = DataLoader(_WeakOnly(ds), batch_size=256, shuffle=False,
