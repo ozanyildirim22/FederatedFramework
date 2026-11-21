@@ -57,11 +57,13 @@ class Experiment:
         self.strategy = STRATEGIES.build(cfg.strategy.name, cfg.strategy,
                                          self.data.num_classes, **cfg.strategy.params)
         # Tier 3 - server
-        self.model = build_model(cfg.model, self.data.num_classes, self.data.in_channels)
+        self.model = self.strategy.prepare_model(
+            build_model(cfg.model, self.data.num_classes, self.data.in_channels))
         aggregator = AGGREGATORS.build(cfg.server.aggregator, **cfg.server.params)
         self.server = Server(self.model, aggregator, self.clients, cfg.server.client_fraction,
                              self.device, seed=cfg.seed)
         self.test_loader = self.data.test_loader()
+        self.strategy.setup(self)
         self.history: List[Dict[str, float]] = []
 
         stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -79,9 +81,11 @@ class Experiment:
     def run_round(self, rnd: int) -> Dict[str, float]:
         t0 = time.time()
         selected = self.server.select_clients()                 # orchestration
+        self.strategy.on_server_round_start(self.server, selected, rnd)
         global_state = self.server.broadcast()                  # downlink
         updates = [c.fit(self.model, global_state, self.strategy, self.device)
                    for c in selected]                           # local execution + uplink
+        self.strategy.on_server_round_end(self.server, updates, global_state, rnd)
         self.server.aggregate(updates)                          # global aggregation
 
         rec: Dict[str, float] = {"round": rnd, "num_clients": len(selected)}

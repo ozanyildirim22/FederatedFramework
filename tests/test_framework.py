@@ -87,3 +87,62 @@ def test_gui_config_roundtrip_and_build():
     assert "tau" in gui.default_params(STRATEGIES.get("fedlabel"))
     assert "weight_by" in gui.default_params(AGGREGATORS.get("fedadam"))
     gui.build_app()
+
+
+# ------------------------------------------------------------ new algorithms
+@pytest.mark.parametrize("strategy", ["fedavg", "fedprox", "fedmatch", "fedtrinet"])
+def test_baselines_and_ssfl_algorithms_run(tmp_path, strategy):
+    over = {"strategy.name": strategy, "server.rounds": 3}
+    cfg = tiny_cfg(out=tmp_path, **over)
+    cfg.strategy.params = {"pretrain_rounds": 1, "finetune_steps": 1} if strategy == "fedtrinet" else {}
+    hist = Experiment(cfg, verbose=False).run()
+    assert len(hist) == 3 and 0.0 <= hist[-1]["test_acc"] <= 1.0
+    if strategy == "fedtrinet":
+        assert "train_threshold" in hist[-1] and "train_loss_unsup" in hist[-1]
+        assert "train_threshold" not in hist[0]          # phase I = labeled-only FedAvg
+    if strategy == "fedmatch":
+        assert hist[-1]["train_num_helpers"] > 0          # helpers were sent from round 2 on
+
+
+def test_fedprox_uses_mu():
+    cfg = tiny_cfg(out="unused")
+    s = STRATEGIES.build("fedprox", cfg.strategy, 10, mu=0.3)
+    assert s.prox_mu == 0.3 and not s.uses_unlabeled
+
+
+def test_fedmatch_decomposition_routes_gradients():
+    from ssfl.strategies import DecomposedModel
+    base = torch.nn.Linear(4, 3)
+    m = DecomposedModel(base)
+    x = torch.randn(5, 4)
+    m(x, "sup").sum().backward()
+    assert base.weight.grad is not None and m.psi[0].grad is None
+    base.zero_grad()
+    m(x, "unsup").sum().backward()
+    assert base.weight.grad is None and m.psi[0].grad is not None
+    merged = m.merged_state(m.state_dict())
+    assert torch.allclose(merged["weight"], base.weight + m.psi[0])
+
+
+def test_fedtrinet_threshold_schedule_and_split():
+    cfg = tiny_cfg(out="unused")
+    s = STRATEGIES.build("fedtrinet", cfg.strategy, 10)
+    assert s.threshold_scale(0) == 1.0 and s.threshold_scale(9) == 1.0
+    assert s.threshold_scale(10) == pytest.approx(0.8) and s.threshold_scale(40) == 0.5
+    model = ssfl.build_model(cfg.model, 10, 3)
+    keys = s._resolve_global_keys(model)
+    assert keys and all(k.startswith("features.") for k in keys)
+    assert not any(k.startswith("classifier") for k in keys)
+
+
+def test_thesis_grid_expands():
+    from ssfl.grid import expand_grid
+    runs = expand_grid("configs/grids/thesis.yaml")
+    names = [n for n, _ in runs]
+    assert len(names) == len(set(names)) == 33
+    cfg = dict(runs)["organamnist_fedtrinet_l0p05"]
+    assert cfg.strategy.name == "fedtrinet" and cfg.data.labeled_ratio == 0.05
+    assert "lambda_kl" not in cfg.strategy.params         # preset params are replaced
+    assert dict(runs)["cifar10_fedtrinet_l0p2"].strategy.params["pretrain_rounds"] == 40
+    for name, cfg in runs:                                 # every param set is accepted
+        STRATEGIES.build(cfg.strategy.name, cfg.strategy, 10, **cfg.strategy.params)

@@ -47,8 +47,29 @@ class Strategy:
         self.global_model: Optional[nn.Module] = None
         self._global_params = None
         self.device = torch.device("cpu")
+        self.prox_mu: float = float(getattr(cfg, "prox_mu", 0.0) or 0.0)
+        self.round: int = 0          # current communication round (1-based), set by the server hook
+        self.step: int = 0           # current local step within the round
 
-    # ----------------------------------------------------------------- hooks
+    # ---------------------------------------------------------- server hooks
+    # Some algorithms (FedMatch, FedTriNet) have a server-side part. In the
+    # simulation the same Strategy object plays both roles; these hooks are
+    # the server side and run outside any client's local training.
+    def setup(self, experiment) -> None:
+        """Called once after the data, model and server have been built."""
+
+    def prepare_model(self, model: nn.Module) -> nn.Module:
+        """Wrap / modify the global architecture (e.g. FedMatch sigma+psi). Called once."""
+        return model
+
+    def on_server_round_start(self, server, selected, rnd: int) -> None:
+        """Server side, before broadcast. Default: record the round number."""
+        self.round = rnd
+
+    def on_server_round_end(self, server, updates, global_state, rnd: int) -> None:
+        """Server side, after uploads and before aggregation (``global_state`` = W_t)."""
+
+    # ----------------------------------------------------------- client hooks
     def on_round_start(self, model: nn.Module, client) -> None:
         """Called after the global weights were loaded into ``model``."""
 
@@ -70,10 +91,10 @@ class Strategy:
         raise ValueError(f"Unknown optimizer '{c.optimizer}'")
 
     def proximal_term(self, model: nn.Module) -> Optional[torch.Tensor]:
-        if self.cfg.prox_mu <= 0 or self._global_params is None:
+        if self.prox_mu <= 0 or self._global_params is None:
             return None
         sq = sum(((p - g) ** 2).sum() for p, g in zip(model.parameters(), self._global_params))
-        return 0.5 * self.cfg.prox_mu * sq
+        return 0.5 * self.prox_mu * sq
 
     # ------------------------------------------------------------ main loop
     def num_steps(self, client) -> int:
@@ -94,7 +115,7 @@ class Strategy:
             self.global_model = copy.deepcopy(model).eval()
             for p in self.global_model.parameters():
                 p.requires_grad_(False)
-        if self.cfg.prox_mu > 0:
+        if self.prox_mu > 0:
             self._global_params = [p.detach().clone() for p in model.parameters()]
 
         self.on_round_start(model, client)

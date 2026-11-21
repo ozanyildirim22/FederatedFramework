@@ -16,14 +16,18 @@ ssfl/
 │   └── manager.py       #   DataManager: builds every client's labeled & unlabeled loaders
 ├── strategies/          # ── Tier 2: Client-Side Execution Module
 │   ├── base.py          #   Training Protocol Interface (epochs, backprop, FedProx term)
-│   └── algorithms.py    #   Pseudo-Labeling Engines: supervised, pseudolabel, fixmatch, fedlabel
+│   ├── algorithms.py    #   Pseudo-Labeling Engines: supervised, pseudolabel, fixmatch, fedlabel
+│   ├── baselines.py     #   fedavg, fedprox (labeled-only FL baselines)
+│   ├── fedmatch.py      #   FedMatch (inter-client consistency + sigma/psi decomposition)
+│   └── fedtrinet.py     #   FedTriNet (local / global / combined models + dynamic threshold)
 ├── losses.py            #   Composite Loss Calculator (CE + masked CE + KL consistency)
 ├── client.py            #   Client: load W_t -> local train -> return delta_w_k
 ├── server/              # ── Tier 3: Server-Side Aggregation Module
 │   ├── server.py        #   client selection (fraction C), broadcast, aggregation, evaluation
 │   └── aggregators.py   #   fedavg, fedavgm, fedadam, fedmedian
 ├── models.py            # simple_cnn, resnet18 (BatchNorm or GroupNorm)
-└── experiment.py        # wires everything + logging (metrics.csv, summary.json, model)
+├── experiment.py        # wires everything + logging (metrics.csv, summary.json, model)
+└── grid.py              # runs a whole grid of experiments from one YAML (resumable)
 ```
 
 ## Google Colab
@@ -76,6 +80,20 @@ python -m ssfl -c configs/cifar10_fedlabel.yaml --set strategy.params.selection=
 python -m ssfl -c configs/cifar10_fedlabel.yaml --set strategy.prox_mu=0.01              # + FedProx
 ```
 
+### Full thesis grid
+
+`configs/grids/thesis.yaml` lists every run of the thesis: the 3 datasets × 2 label ratios ×
+5 algorithms (FedAvg, FedProx, FedMatch, FedTriNet, FedLabel), plus the FedLabel ablations (33 runs).
+
+```bash
+python -m ssfl --grid configs/grids/thesis.yaml --dry-run              # list the runs
+python -m ssfl --grid configs/grids/thesis.yaml --only organamnist     # run a subset
+python -m ssfl --grid configs/grids/thesis.yaml --set data.num_workers=2
+```
+
+A run whose `runs/<name>_*/summary.json` already exists is skipped, so an interrupted grid
+continues where it stopped (`--no-resume` runs everything again).
+
 Or from Python:
 
 ```python
@@ -91,11 +109,25 @@ and `global_model.pt`.
 
 | Client strategy (`strategy.name`) | Description |
 |---|---|
-| `supervised` | FedAvg on labeled data only (lower bound). With `data.labeled_ratio=1.0` → fully-supervised upper bound. |
+| `fedavg` | FedAvg (McMahan et al., 2017) on each client's labeled data. With `data.labeled_ratio=1.0` → fully supervised upper bound. (`supervised` is the same algorithm.) |
+| `fedprox` | FedProx (Li et al., 2020): FedAvg + proximal term `mu/2·‖w − W_t‖²` (`mu`, default 0.01). |
+| `fedmatch` | FedMatch (Jeong et al., ICLR 2021): weights `sigma + psi`; `sigma` learns from labeled data, `psi` from unlabeled data. Pseudo-labels come from a vote of the local model and `num_helpers` helper models chosen by the server (nearest neighbours of a model embedding), enforced on the strong view, + inter-client KL consistency and L1/L2 terms on `psi`. Params: `tau`, `lambda_s`, `lambda_iccs`, `lambda_l1`, `lambda_l2`, `num_helpers`, `helper_every`, `decompose`. |
+| `fedtrinet` | FedTriNet (Che et al., 2021): `pretrain_rounds` of FedAvg on labeled data, then three players — the client's previous local model, the global model and a combined model (global shallow layers + local deep layers) — average their softmax outputs to give pseudo-labels. These are kept above a dynamic threshold `theta(t)`: clients upload `max p_G`, the server averages it, and the threshold decays with the paper's schedule (`alpha`=0.93). Params: `pretrain_rounds`, `alpha`, `lambda_u`, `finetune_steps`, `global_layers`, `unsup_view`. |
+| `fedlabel` | FedLabel (Cho et al., ICCV 2023): per-sample choice between the local and the frozen global model, by confidence score (`variance` / `max_prob` / `entropy`), threshold `tau`, + global-local KL consistency (`lambda_kl`). `selection: local|global` gives the ablations. |
 | `pseudolabel` | Hard pseudo-labels above threshold `tau` (Lee, 2013). |
 | `fixmatch` | Weak-view pseudo-label enforced on strong view (FedAvg + FixMatch). |
-| `fedlabel` | Per-sample choice between local and frozen global model, by confidence score (`variance` / `max_prob` / `entropy`), threshold `tau`, + global-local KL consistency (`lambda_kl`). `selection: local|global` gives the ablations. |
-| any + `strategy.prox_mu > 0` | Adds the FedProx proximal term to any strategy. |
+| any + `strategy.prox_mu > 0` | Adds the FedProx proximal term to any strategy (e.g. FixMatch + FedProx). |
+
+Each algorithm's docstring (`ssfl/strategies/*.py`) gives the equations and lists
+every implementation choice the paper leaves open.
+
+| Dataset (`data.dataset`) | Classes | Train / test | Setting in the presets |
+|---|---|---|---|
+| `cifar10` | 10 | 50,000 / 10,000 (32×32 RGB) | cross-device: 100 clients, C = 0.1, 200 rounds, 20% / 50% labels |
+| `organamnist` | 11 | 34,561 / 17,778 (28×28 gray) | cross-silo: 10 clients, C = 1.0, 100 rounds, 5% / 20% labels |
+| `pathmnist` | 9 | 89,996 / 7,180 (28×28 RGB, val split unused) | cross-silo: 10 clients, C = 1.0, 100 rounds, 5% / 20% labels |
+
+All three download automatically into `data.root` the first time they are used.
 
 | Aggregator (`server.aggregator`) | Description |
 |---|---|
@@ -132,6 +164,12 @@ class MyRule(Aggregator):
     def combine(self, key, deltas, weights):   # deltas: (num_clients, *param_shape)
         ...
 ```
+
+Algorithms with a server-side part (like FedMatch's helper selection or FedTriNet's
+threshold) override the server hooks of `Strategy`: `setup(experiment)`,
+`prepare_model(model)` (wrap the architecture once), `on_server_round_start(server, selected, rnd)`
+and `on_server_round_end(server, updates, global_state, rnd)`. The client-side hooks are
+`on_round_start(model, client)` / `on_round_end(model, client)`.
 
 Then use `strategy.name: my_algo` / `server.aggregator: my_rule` in YAML. The same works
 for `DATASETS`, `PARTITIONERS` and `MODELS`. See `examples/custom_algorithm.py`.

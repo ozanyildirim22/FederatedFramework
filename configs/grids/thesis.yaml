@@ -1,0 +1,60 @@
+# Full thesis grid: every dataset x label ratio x algorithm.
+#   python -m ssfl --grid configs/grids/thesis.yaml --dry-run
+#   python -m ssfl --grid configs/grids/thesis.yaml --only organamnist
+# Finished runs (runs/<name>_*/summary.json) are skipped, so the grid can be resumed.
+# Extra --set overrides apply to every run, e.g. --set data.num_workers=2 output_dir=/content/drive/MyDrive/ssfl/runs
+
+algorithms:
+  fedavg: {}                         # labeled data only
+  fedprox:
+    mu: 0.01
+  fedmatch:
+    tau: 0.85
+    lambda_s: 10.0
+    lambda_iccs: 0.01
+    lambda_l2: 10.0
+    lambda_l1: 0.0001
+    num_helpers: 2
+    helper_every: 10
+  fedtrinet:
+    pretrain_rounds: 20
+    alpha: 0.93
+    lambda_u: 1.0
+    finetune_steps: 5
+  fedlabel:
+    tau: 0.95
+    lambda_u: 1.0
+    lambda_kl: 1.0
+    temperature: 1.0
+    confidence: variance
+    selection: adaptive
+    local_warmup_steps: 5
+
+experiments:
+  # Cross-device: 100 clients, C = 0.1, 200 rounds
+  - config: configs/cifar10_fedlabel.yaml
+    labeled_ratio: [0.2, 0.5]
+    algorithm_params:
+      fedtrinet: {pretrain_rounds: 40}
+  # Cross-silo: 10 clients, C = 1.0, 100 rounds
+  - config: configs/organamnist_fedlabel.yaml
+    labeled_ratio: [0.05, 0.2]
+  - config: configs/pathmnist_fedlabel.yaml
+    labeled_ratio: [0.05, 0.2]
+
+  # FedLabel ablations (OrganAMNIST, 5% labels)
+  - config: configs/organamnist_fedlabel.yaml
+    labeled_ratio: [0.05]
+    tag: sel_local
+    algorithms: [fedlabel]
+    algorithm_params: {fedlabel: {selection: local}}
+  - config: configs/organamnist_fedlabel.yaml
+    labeled_ratio: [0.05]
+    tag: sel_global
+    algorithms: [fedlabel]
+    algorithm_params: {fedlabel: {selection: global}}
+  - config: configs/organamnist_fedlabel.yaml
+    labeled_ratio: [0.05]
+    tag: conf_maxprob
+    algorithms: [fedlabel]
+    algorithm_params: {fedlabel: {confidence: max_prob}}
