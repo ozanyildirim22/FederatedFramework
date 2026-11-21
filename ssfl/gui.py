@@ -379,9 +379,12 @@ class RunController:
                 continue
             if self.stop_event.is_set():
                 break
+            root = run["cfg"].data.root
+            size0 = _dir_size(root)
             with self.lock:
                 self.current = i
                 run["status"], run["started"] = "running", time.time()
+                run["root"], run["root_size0"] = root, size0
                 self.message = (f"Loading data and building clients for {run['name']} … "
                                 "(the first run of a dataset also downloads it)")
                 self.version += 1
@@ -495,6 +498,11 @@ def render_status(snap) -> str:
         head += f'<span class="muted">{html.escape(r["name"])} · run {pos}/{len(active)}</span>'
     eta = _eta(snap)
     foot = [html.escape(snap["message"])]
+    if (0 <= cur < len(plan) and plan[cur]["status"] == "running" and not plan[cur].get("data_ready")
+            and plan[cur].get("root")):
+        mb = (_dir_size(plan[cur]["root"]) - plan[cur].get("root_size0", 0)) / 2**20
+        if mb > 0.05:
+            foot.append(f"downloaded {mb:.1f} MB")
     if 0 <= cur < len(plan) and (plan[cur]["history"] or plan[cur].get("data_ready")):
         done, total = len(plan[cur]["history"]), plan[cur]["cfg"].server.rounds
         if state in ("running", "stopping") and plan[cur]["status"] == "running" and done < total:
@@ -822,6 +830,37 @@ def run_curves(runs_dir: str, names: Sequence[str], metric: str) -> pd.DataFrame
 
 
 # ------------------------------------------------------------- partition
+#: Last dataset loaded for a preview, keyed by (name, root, image size): previews are instant
+#: after the first one.
+RAW_CACHE: Dict[Tuple[str, str, int], Any] = {}
+#: Latest preview request per browser session (an older, still-loading preview stops updating).
+PREVIEW_SEQ: Dict[str, int] = {}
+LOAD_LOCKS: Dict[Tuple[str, str, int], threading.Lock] = {}
+
+
+def _dir_size(root: str) -> int:
+    """Bytes under ``root`` (used to show download progress)."""
+    import os
+    total = 0
+    for dirpath, _, files in os.walk(root):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(dirpath, f))
+            except OSError:
+                pass
+    return total
+
+
+def _busy_html(msg: str) -> str:
+    return f'<div class="busy"><span class="spinner"></span><span>{msg}</span></div>'
+
+
+def _error_html(msg: str, details: str = "") -> str:
+    more = (f'<details><summary>Details</summary><pre>{html.escape(details)}</pre></details>'
+            if details else "")
+    return f'<div class="busy err"><b>⚠️ {html.escape(msg)}</b>{more}</div>'
+
+
 def partition_frame(manager, max_clients: int = 40) -> pd.DataFrame:
     rows = []
     for cid, part in enumerate(manager.partitions[:max_clients]):
@@ -992,6 +1031,13 @@ footer { display:none !important; }
 .algo-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(280px,1fr)); gap:10px; }
 .tips li { margin:4px 0; font-size:14px; }
 .param-group { border-radius:14px !important; }
+.busy { display:flex; align-items:center; gap:12px; flex-wrap:wrap; border-radius:14px; padding:14px 16px;
+  border:1px solid var(--border-color-primary); background:var(--block-background-fill); font-size:14px; }
+.busy.err { border-color:var(--ss-err); display:block; }
+.busy pre { white-space:pre-wrap; font-size:11.5px; max-height:220px; overflow:auto; }
+.spinner { width:18px; height:18px; border-radius:50%; flex:none; border:3px solid rgba(99,102,241,.25);
+  border-top-color:var(--ss-a); animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
 """
 
 
@@ -1152,7 +1198,9 @@ def build_app():
                                                           color="series", title="Pseudo-label quality",
                                                           y_title="rate", y_lim=[0, 1], height=250,
                                                           color_title=" ")
-                            with gr.Tab("🧩  Data split", id="partition"):
+                            # render_children: mount the chart at page load. A chart first mounted
+                            # while data is arriving drew its bars without colours.
+                            with gr.Tab("🧩  Data split", id="partition", render_children=True):
                                 part_stats = gr.HTML('<div class="algo-info empty">Press <b>Preview split</b> '
                                                      'to see how the data is divided between clients.</div>')
                                 part_plot = gr.BarPlot(pd.DataFrame({"client": pd.Series(dtype="str"),
@@ -1314,17 +1362,75 @@ def build_app():
 
         save_btn.click(on_save, cfg_inputs, [notice, preset])
 
-        def on_preview(*vals):
+        def on_preview(*vals, request: gr.Request = None):
+            """Streams progress: the first use of a dataset downloads it (can take minutes
+            on Colab / Drive), so show elapsed time and downloaded MB instead of nothing.
+            A newer click in the same browser session takes over the panel."""
             from .data import DataManager
+            session = getattr(request, "session_hash", None) or "default"
+            my_id = PREVIEW_SEQ[session] = PREVIEW_SEQ.get(session, 0) + 1
+
+            def superseded() -> bool:
+                return PREVIEW_SEQ.get(session) != my_id
+
             try:
                 cfg = _configs(*vals)[0]
-                dm = DataManager(cfg.data, cfg.server.num_clients, seed=cfg.seed)
-                return (plot_update(partition_frame(dm), "class"), partition_stats(dm), gr.update(visible=False),
-                        gr.Tabs(selected="partition"))
             except Exception as e:  # noqa: BLE001
-                return gr.update(), gr.update(), warn(e), gr.update()
+                yield gr.update(), gr.update(), warn(e), gr.update()
+                return
+            key = (cfg.data.dataset, str(Path(cfg.data.root).resolve()), cfg.data.image_size)
+            result: Dict[str, Any] = {}
 
-        preview_btn.click(on_preview, cfg_inputs, [part_plot, part_stats, notice, dash_tabs])
+            def work():
+                try:
+                    # one loader per dataset at a time: a second click waits for the running
+                    # download instead of writing the same file twice
+                    with LOAD_LOCKS.setdefault(key, threading.Lock()):
+                        raw = RAW_CACHE.get(key)
+                        if raw is None:
+                            raw = DATASETS.get(cfg.data.dataset)(cfg.data)
+                            RAW_CACHE.clear()              # keep one dataset in memory
+                            RAW_CACHE[key] = raw
+                    result["dm"] = DataManager(cfg.data, cfg.server.num_clients, seed=cfg.seed, raw=raw)
+                except Exception:  # noqa: BLE001 - shown in the panel
+                    result["error"] = traceback.format_exc()
+
+            t0, size0 = time.time(), _dir_size(cfg.data.root)
+            worker = threading.Thread(target=work, daemon=True)
+            worker.start()
+            first = True
+            while worker.is_alive():
+                if superseded():                   # a newer preview owns the panel now
+                    return
+                mb = (_dir_size(cfg.data.root) - size0) / 2**20
+                msg = (f"Loading <b>{html.escape(cfg.data.dataset)}</b> from "
+                       f"<code>{html.escape(cfg.data.root)}</code> · elapsed {_fmt_secs(time.time() - t0)}"
+                       + (f" · downloaded {mb:.1f} MB" if mb > 0.05 else
+                          " · the first use of a dataset downloads it"))
+                yield (gr.update(), _busy_html(msg), gr.update(visible=False),
+                       gr.Tabs(selected="partition") if first else gr.update())
+                first = False
+                worker.join(timeout=1.0)
+            if superseded():
+                return
+            if "error" in result:
+                err = result["error"].strip().splitlines()[-1]
+                yield (gr.update(), _error_html(f"Could not load the data: {err}", result["error"]),
+                       warn(err), gr.Tabs(selected="partition"))
+                return
+            dm = result["dm"]
+            frame = partition_frame(dm)
+            yield (plot_update(frame, "class"), partition_stats(dm), gr.update(visible=False),
+                   gr.Tabs(selected="partition"))
+            # The bar chart does not rebuild its colour scale when data and colours arrive in
+            # the same update (bars came out uncoloured). Re-sending a changed colour map once
+            # the data is in place forces that rebuild; the extra key matches no bar.
+            time.sleep(0.5)
+            yield (gr.update(color_map={**color_map(frame, "class"), "​": "#000000"}),
+                   gr.update(), gr.update(), gr.update())
+
+        preview_btn.click(on_preview, cfg_inputs, [part_plot, part_stats, notice, dash_tabs],
+                          show_progress="hidden", trigger_mode="multiple")
 
         # ---------------------------------------------------- live dashboard
         def exp_view(snap):

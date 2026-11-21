@@ -70,12 +70,13 @@ class ClientData:
 class DataManager:
     """Loads a dataset, partitions it across clients and builds DataLoaders."""
 
-    def __init__(self, cfg, num_clients: int, seed: int = 0):
+    def __init__(self, cfg, num_clients: int, seed: int = 0, raw=None):
+        """``raw`` = an already loaded ``(train, test)`` pair (skips loading, e.g. a GUI cache)."""
         self.cfg = cfg
         self.num_clients = num_clients
         self.rng = np.random.default_rng(seed)
 
-        self.train, self.test = DATASETS.get(cfg.dataset)(cfg)
+        self.train, self.test = raw if raw is not None else DATASETS.get(cfg.dataset)(cfg)
         self.num_classes = self.train.num_classes
         self.in_channels = self.train.in_channels
         self.aug = AugmentationFactory(self.train.image_size, self.train.mean, self.train.std,
