@@ -47,19 +47,25 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 pip install -e .[dev,gui]
 ```
 
-## Graphical interface
+## Graphical interface — SSFL Studio
 
 ```bash
 python -m ssfl --gui          # opens http://127.0.0.1:7860
 ```
 
-* **Experiment tab** — start from a preset, change any setting (dropdowns list every
-  registered dataset / strategy / aggregator, including your own plug-ins), click
-  **Preview data partition** to see the non-IID class split per client, then
-  **Run** to watch accuracy, loss and pseudo-label statistics update every round.
-  **Stop** ends the run after the current round; **Save as preset** writes `configs/<name>.yaml`.
-* **Results tab** — tick finished runs to overlay their curves and get a summary table.
-* In Colab: `from ssfl.gui import launch; launch()` shows the GUI inside the notebook.
+* **🧪 Experiment** — click a **scenario** card (Quick demo, OrganAMNIST, PathMNIST, CIFAR-10),
+  tick one or **several algorithms** (they run one after another on the same data split),
+  set the labeled ratio / rounds / non-IID α, and press **🚀 Launch**. Each algorithm's
+  parameters appear as a form with explanations; nothing has to be typed as JSON.
+  The dashboard shows live KPI cards (test accuracy, best accuracy, pseudo-label mask
+  and accuracy, loss, ETA) and charts; **🧩 Preview split** shows how the classes are
+  spread across clients. Refreshing the page re-attaches to a running job.
+* **🗺️ Thesis grid** — run `configs/grids/thesis.yaml` (or the seconds-long `demo.yaml`)
+  with a live status table; finished runs are skipped.
+* **🏆 Results** — leaderboard, curves of any metric, and the **thesis table**
+  (best accuracy per algorithm × dataset × label ratio) with CSV and LaTeX download.
+* **📘 Guide** — what every algorithm does and how to use the studio.
+* In Colab: `from ssfl.gui import launch; launch(share=True)` shows the GUI inside the notebook.
 
 ## Run
 

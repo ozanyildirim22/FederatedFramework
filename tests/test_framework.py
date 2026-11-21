@@ -83,10 +83,17 @@ def test_gui_config_roundtrip_and_build():
     from ssfl import gui
     for preset in gui.list_presets():
         cfg = gui.load_preset(preset)
-        assert gui.values_to_cfg(*gui.cfg_to_values(cfg)).to_dict() == cfg.to_dict()
+        back = gui.values_to_cfg(*gui.cfg_to_values(cfg), algorithm=cfg.strategy.name,
+                                 params=cfg.strategy.params)
+        assert back.to_dict() == cfg.to_dict()
+        multi = gui.build_configs(gui.cfg_to_values(cfg), ["fedavg", "fedmatch"], {"fedmatch": {"tau": 0.7}})
+        assert [c.strategy.name for c in multi] == ["fedavg", "fedmatch"]
+        assert multi[1].strategy.params == {"tau": 0.7} and multi[0].name != multi[1].name
     assert "tau" in gui.default_params(STRATEGIES.get("fedlabel"))
     assert "weight_by" in gui.default_params(AGGREGATORS.get("fedadam"))
     gui.build_app()
+    assert "Ready" in gui.render_status(gui.RunController().snapshot())
+    assert gui.to_latex(gui.thesis_table([])).startswith("%")
 
 
 # ------------------------------------------------------------ new algorithms

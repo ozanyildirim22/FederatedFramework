@@ -33,6 +33,19 @@ import yaml
 from .config import ExperimentConfig, apply_overrides
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _resolve(config: str, grid_file: str | Path) -> Path:
+    """A preset path in a grid file may be relative to the working directory,
+    to the grid file, or to the project root (in that order)."""
+    for base in (Path.cwd(), Path(grid_file).resolve().parent, PROJECT_ROOT):
+        p = Path(config) if Path(config).is_absolute() else base / config
+        if p.exists():
+            return p
+    raise FileNotFoundError(f"Preset '{config}' not found (from grid {grid_file})")
+
+
 def _ratio_tag(r: float) -> str:
     return f"{r:g}".replace(".", "p")
 
@@ -44,7 +57,7 @@ def expand_grid(path: str | Path, extra: Optional[Sequence[str]] = None
     common: Dict[str, Any] = spec.get("common") or {}
     runs: List[Tuple[str, ExperimentConfig]] = []
     for exp in spec.get("experiments") or []:
-        raw = yaml.safe_load(Path(exp["config"]).read_text(encoding="utf-8")) or {}
+        raw = yaml.safe_load(_resolve(exp["config"], path).read_text(encoding="utf-8")) or {}
         raw = apply_overrides(raw, common)
         raw = apply_overrides(raw, exp.get("overrides") or {})
         ratios = exp.get("labeled_ratio") or [raw.get("data", {}).get("labeled_ratio", 0.2)]
