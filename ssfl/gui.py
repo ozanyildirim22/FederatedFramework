@@ -705,8 +705,8 @@ def leaderboard(runs: List[Dict[str, Any]]) -> pd.DataFrame:
 
 def thesis_table(runs: List[Dict[str, Any]]) -> pd.DataFrame:
     """Rows = algorithm (variant), columns = dataset @ label ratio, cells = best test accuracy (%).
-    For repeated runs of the same setting, the most recent one is used."""
-    rows = [r for r in runs if r["best_acc"] is not None]
+    Only finished runs count; for repeated runs of the same name the most recent one is used."""
+    rows = [r for r in runs if r["best_acc"] is not None and r["finished"]]
     if not rows:
         return pd.DataFrame()
     latest: Dict[str, Dict[str, Any]] = {}
@@ -724,17 +724,26 @@ def thesis_table(runs: List[Dict[str, Any]]) -> pd.DataFrame:
     return piv
 
 
+def _tex(text: str) -> str:
+    """Escape LaTeX special characters (``%`` would otherwise start a comment)."""
+    out = str(text).replace("\\", r"\textbackslash{}")
+    for ch in "%_&#$":
+        out = out.replace(ch, "\\" + ch)
+    return out
+
+
 def to_latex(table: pd.DataFrame, caption: str = "Best test accuracy (%)") -> str:
     if table is None or not len(table):
         return "% no results yet\n"
     cols = list(table.columns)
     num = table[cols[1:]].apply(pd.to_numeric, errors="coerce")
     best = num.max(axis=0)
-    lines = [r"\begin{table}[t]", r"\centering", f"\\caption{{{caption}}}",
+    lines = [r"% requires \usepackage{booktabs}", r"\begin{table}[t]", r"\centering",
+             f"\\caption{{{_tex(caption)}}}",
              r"\begin{tabular}{l" + "c" * (len(cols) - 1) + "}", r"\toprule",
-             " & ".join(c.replace("%", r"\%").replace("_", r"\_") for c in cols) + r" \\", r"\midrule"]
+             " & ".join(_tex(c) for c in cols) + r" \\", r"\midrule"]
     for i, row in table.iterrows():
-        cells = [str(row[cols[0]]).replace("_", r"\_")]
+        cells = [_tex(row[cols[0]])]
         for c in cols[1:]:
             v = num.loc[i, c]
             if v != v:
@@ -825,6 +834,14 @@ footer { display:none !important; }
 .chip { background:rgba(255,255,255,.16); border:1px solid rgba(255,255,255,.28); backdrop-filter: blur(6px);
   padding:6px 12px; border-radius:999px; font-size:12.5px; font-weight:600; display:inline-flex;
   align-items:center; gap:7px; white-space:nowrap; }
+@media (max-width: 640px) {
+  .hero { padding:18px; border-radius:16px; }
+  .hero-main { flex-direction:column; align-items:flex-start; gap:10px; }
+  .hero h1 { font-size:24px !important; }
+  .hero p { font-size:13.5px; }
+  .logo { width:42px; height:42px; }
+  .chip { white-space:normal; }
+}
 .led { width:8px; height:8px; border-radius:50%; background:#fbbf24; display:inline-block; }
 .led.on { background:#34d399; box-shadow:0 0 0 3px rgba(52,211,153,.3); }
 
@@ -1152,8 +1169,9 @@ def build_app():
                         curve_plot = gr.LinePlot(_typed([]), x="round",
                                                  y="value", color="run", height=380)
                     with gr.Tab("🎓  Thesis table"):
-                        gr.Markdown("Best test accuracy (%) per algorithm and setting; latest run of each "
-                                    "setting. Bold in LaTeX = best in column.")
+                        gr.Markdown("Best test accuracy (%) per algorithm and setting, from finished runs "
+                                    "(latest run of each name). Bold in LaTeX = best in column; the "
+                                    "table uses the `booktabs` package.")
                         thesis = gr.Dataframe(pd.DataFrame(), wrap=True)
                         with gr.Row():
                             dl_csv = gr.DownloadButton("⬇  Leaderboard CSV", value=None)
@@ -1196,8 +1214,13 @@ def build_app():
 
         param_comps = [f[3] for f in param_fields]
         for algo, key, kind, comp in param_fields:
-            comp.input(_param_updater(algo, key, kind), [comp, params_state], params_state,
-                       show_progress="hidden")
+            # Every edit rewrites the whole parameter dict, so the updates must run one at a
+            # time and in order (one shared queue); otherwise a slower event overwrites a
+            # newer edit. Free-text JSON fields save on blur / Enter, not on every keystroke.
+            events = [comp.blur, comp.submit] if kind not in (bool, int, float, str) else [comp.input]
+            gr.on(events, _param_updater(algo, key, kind), [comp, params_state], params_state,
+                  show_progress="hidden", concurrency_limit=1, concurrency_id="param-state",
+                  trigger_mode="always_last" if kind in (int, float) else "multiple")
 
         def on_preset(p):
             cfg = load_preset(p)
@@ -1208,7 +1231,8 @@ def build_app():
                     *param_values(state))
 
         # `.input` fires only on user edits, so loading a preset keeps its tuned params.
-        preset.input(on_preset, preset, components + [algos, params_state, algo_info] + param_comps).then(
+        preset.input(on_preset, preset, components + [algos, params_state, algo_info] + param_comps,
+                     concurrency_limit=1, concurrency_id="param-state").then(
             show_yaml, cfg_inputs, yaml_view)
 
         def on_algos(sel):
@@ -1286,7 +1310,10 @@ def build_app():
             ctrl.start([(c.name, c, "queued") for c in cfgs], "experiment")
             first = True
             for out in stream(exp_view, "experiment"):
-                yield (gr.update(visible=False), gr.Tabs(selected="charts") if first else gr.update(), *out)
+                # hide an old notice once; later updates leave it alone so a warning from a
+                # second click (e.g. "already running") stays visible
+                yield (gr.update(visible=False) if first else gr.update(),
+                       gr.Tabs(selected="charts") if first else gr.update(), *out)
                 first = False
 
         run_btn.click(on_run, cfg_inputs, [notice, dash_tabs] + exp_outputs, show_progress="hidden")
@@ -1403,7 +1430,8 @@ def build_app():
                   + _kpi("Runs", str(len(sel)), f"{n_fin} finished · {len(sel) - n_fin} partial", "a1")
                   + _kpi("Best accuracy", f"{100 * best:.1f}<span>%</span>" if sel else "—",
                          next((r["base"] for r in sel if r["best_acc"] == best), ""), "a2")
-                  + _kpi("Datasets", str(len({r['dataset'] for r in sel})), ", ".join(datasets)[:60], "a3")
+                  + _kpi("Datasets", str(len({r['dataset'] for r in sel})),
+                         ", ".join(sorted({r['dataset'] for r in sel}))[:60], "a3")
                   + _kpi("Algorithms", str(len({r['variant'] for r in sel})), "", "a4") + "</div>")
             return (gr.update(choices=datasets), gr.update(choices=algos_found),
                     gr.update(choices=names, value=chosen), board_df, thesis_df,
