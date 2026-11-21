@@ -382,7 +382,8 @@ class RunController:
             with self.lock:
                 self.current = i
                 run["status"], run["started"] = "running", time.time()
-                self.message = f"Loading data and building clients for {run['name']} …"
+                self.message = (f"Loading data and building clients for {run['name']} … "
+                                "(the first run of a dataset also downloads it)")
                 self.version += 1
             self._log(f"▶ {run['name']} ({i + 1}/{len(self.plan)})")
 
@@ -401,6 +402,9 @@ class RunController:
                 exp = Experiment(run["cfg"], callbacks=[on_round], verbose=False)
                 with self.lock:
                     run["out_dir"] = str(exp.out_dir)
+                    run["data_ready"] = True
+                    self.message = f"Training {run['name']}"
+                    self.version += 1
                 self._log(exp.data.summary())
                 self._log(f"strategy={run['cfg'].strategy.name} aggregator={run['cfg'].server.aggregator} "
                           f"model={run['cfg'].model.name} device={exp.device} -> {exp.out_dir}")
@@ -491,8 +495,12 @@ def render_status(snap) -> str:
         head += f'<span class="muted">{html.escape(r["name"])} · run {pos}/{len(active)}</span>'
     eta = _eta(snap)
     foot = [html.escape(snap["message"])]
-    if 0 <= cur < len(plan) and plan[cur]["history"]:
-        foot.append(f"round {len(plan[cur]['history'])}/{plan[cur]['cfg'].server.rounds}")
+    if 0 <= cur < len(plan) and (plan[cur]["history"] or plan[cur].get("data_ready")):
+        done, total = len(plan[cur]["history"]), plan[cur]["cfg"].server.rounds
+        if state in ("running", "stopping") and plan[cur]["status"] == "running" and done < total:
+            foot.append(f"round {done + 1}/{total} in progress")
+        else:
+            foot.append(f"round {done}/{total}")
     if snap["started"]:
         foot.append(f"elapsed {_fmt_secs(time.time() - snap['started'])}" if state in ("running", "stopping")
                     else "")
@@ -1327,12 +1335,20 @@ def build_app():
         exp_outputs = [status, kpis, acc_plot, loss_plot, pl_plot, log, metrics]
 
         def stream(view, kind):
-            last = -1
+            """Push a full update whenever the job changes, and refresh only the status
+            banner (first output) once a second in between, so the elapsed time keeps
+            counting while nothing else happens, e.g. while data loads."""
+            last, n_out, last_tick = -1, None, 0.0
             while True:
                 snap = ctrl.snapshot()
                 if snap["kind"] == kind and snap["version"] != last:
-                    last = snap["version"]
-                    yield view(snap)
+                    last, last_tick = snap["version"], time.time()
+                    out = view(snap)
+                    n_out = len(out)
+                    yield out
+                elif snap["kind"] == kind and n_out and time.time() - last_tick >= 1.0:
+                    last_tick = time.time()
+                    yield (render_status(snap), *[gr.update()] * (n_out - 1))
                 if not ctrl.running:
                     snap = ctrl.snapshot()
                     if snap["kind"] == kind and snap["version"] != last:
