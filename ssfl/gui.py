@@ -23,6 +23,7 @@ import copy
 import html
 import inspect
 import json
+import math
 import re
 import tempfile
 import threading
@@ -266,6 +267,36 @@ def _fmt_secs(s: float) -> str:
     if s >= 60:
         return f"{s // 60}m {s % 60:02d}s"
     return f"{s}s"
+
+
+def code_version() -> str:
+    """Short git commit of the running code (shown in the header, printed at launch),
+    so it is easy to tell whether a GUI runs the latest pulled version."""
+    import subprocess
+    try:
+        out = subprocess.run(["git", "-C", str(PROJECT_ROOT), "log", "-1", "--format=%h %cd",
+                              "--date=format:%Y-%m-%d %H:%M"], capture_output=True, text=True, timeout=5)
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except Exception:  # noqa: BLE001 - git missing, not a checkout, ...
+        pass
+    from . import __version__
+    return f"v{__version__}"
+
+
+#: Environment defaults (set by ``launch(data_dir=..., runs_dir=..., num_workers=...)``, e.g. the
+#: Google Drive folders on Colab). They are applied on top of every preset the user loads.
+ENV_DEFAULTS: Dict[str, Any] = {}
+
+
+def apply_env(cfg: ExperimentConfig) -> ExperimentConfig:
+    if ENV_DEFAULTS.get("data_dir"):
+        cfg.data.root = ENV_DEFAULTS["data_dir"]
+    if ENV_DEFAULTS.get("runs_dir"):
+        cfg.output_dir = ENV_DEFAULTS["runs_dir"]
+    if ENV_DEFAULTS.get("num_workers") is not None:
+        cfg.data.num_workers = int(ENV_DEFAULTS["num_workers"])
+    return cfg
 
 
 def system_info() -> Dict[str, str]:
@@ -602,7 +633,9 @@ def render_hero() -> str:
     chips = [f'<span class="chip"><i class="led {"on" if "CPU" not in dev else ""}"></i>{html.escape(dev)}</span>',
              f'<span class="chip">PyTorch {html.escape(info["torch"])}</span>',
              f'<span class="chip">{len(STRATEGIES.names())} algorithms</span>',
-             f'<span class="chip">{len(DATASETS.names())} datasets</span>']
+             f'<span class="chip">{len(DATASETS.names())} datasets</span>',
+             f'<span class="chip" title="git commit of the running code">build {html.escape(code_version())}'
+             '</span>']
     logo = """<svg viewBox="0 0 64 64" class="logo" aria-hidden="true">
       <defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1">
         <stop offset="0" stop-color="#fff" stop-opacity=".95"/><stop offset="1" stop-color="#fff" stop-opacity=".6"/>
@@ -650,11 +683,16 @@ def render_guide() -> str:
 
 
 # ------------------------------------------------------------ results
+#: Timestamp suffix of a run folder: ``_YYYYmmdd-HHMMSS`` plus ``-2``, ``-3`` ... when two
+#: runs with the same name start within the same second.
+RUN_STAMP = r"_\d{8}-\d{6}(?:-\d+)?$"
+
+
 def _run_meta(run_dir: Path) -> Dict[str, Any]:
     cfg = {}
     if (run_dir / "config.yaml").exists():
         cfg = yaml.safe_load((run_dir / "config.yaml").read_text(encoding="utf-8")) or {}
-    base = re.sub(r"_\d{8}-\d{6}$", "", run_dir.name)
+    base = re.sub(RUN_STAMP, "", run_dir.name)
     m = re.search(r"_l[0-9p]+_(.+)$", base)
     algo = cfg.get("strategy", {}).get("name", "?")
     return {"run": run_dir.name, "base": base, "dataset": cfg.get("data", {}).get("dataset", "?"),
@@ -759,7 +797,7 @@ def to_latex(table: pd.DataFrame, caption: str = "Best test accuracy (%)") -> st
 def run_curves(runs_dir: str, names: Sequence[str], metric: str) -> pd.DataFrame:
     rows = []
     root = Path(runs_dir)
-    bases = [re.sub(r"_\d{8}-\d{6}$", "", n) for n in names or []]
+    bases = [re.sub(RUN_STAMP, "", n) for n in names or []]
     for name in names or []:
         p = root / name / "metrics.csv"
         if not p.exists():
@@ -768,7 +806,7 @@ def run_curves(runs_dir: str, names: Sequence[str], metric: str) -> pd.DataFrame
         if metric not in df:
             continue
         d = df.dropna(subset=[metric])
-        label = re.sub(r"_\d{8}-\d{6}$", "", name)
+        label = re.sub(RUN_STAMP, "", name)
         if bases.count(label) > 1:          # repeated setting: keep the timestamp to tell them apart
             label = name
         rows += [{"round": int(r), "value": float(v), "run": label} for r, v in zip(d["round"], d[metric])]
@@ -961,7 +999,7 @@ def build_app():
     presets = list_presets()
     start_preset = "organamnist_fedlabel.yaml" if "organamnist_fedlabel.yaml" in presets else (
         presets[0] if presets else None)
-    start_cfg = load_preset(start_preset)
+    start_cfg = apply_env(load_preset(start_preset))
     v = dict(zip(FIELDS, cfg_to_values(start_cfg)))
     v["name"] = ""
     start_algos = [start_cfg.strategy.name]
@@ -1133,7 +1171,11 @@ def build_app():
                     grid_file = gr.Dropdown(grids, value=grids[0] if grids else None, label="Grid file", scale=2)
                     grid_only = gr.Textbox("", label="Only runs containing",
                                            placeholder="e.g. organamnist fedmatch", scale=2)
-                    grid_extra = gr.Textbox("", label="Extra overrides", scale=3,
+                    env_extra = " ".join(
+                        f"{k}={ENV_DEFAULTS[e]}" for e, k in (("data_dir", "data.root"), ("runs_dir", "output_dir"),
+                                                             ("num_workers", "data.num_workers"))
+                        if ENV_DEFAULTS.get(e) not in (None, ""))
+                    grid_extra = gr.Textbox(env_extra, label="Extra overrides", scale=3,
                                             placeholder="e.g. data.num_workers=2 output_dir=/content/drive/MyDrive/ssfl/runs")
                     grid_skip = gr.Checkbox(True, label="Skip finished", scale=1)
                 with gr.Row():
@@ -1223,7 +1265,7 @@ def build_app():
                   trigger_mode="always_last" if kind in (int, float) else "multiple")
 
         def on_preset(p):
-            cfg = load_preset(p)
+            cfg = apply_env(load_preset(p))
             vals = cfg_to_values(cfg)
             vals[0] = ""                                  # auto run name
             state = {cfg.strategy.name: dict(cfg.strategy.params)}
@@ -1477,7 +1519,11 @@ def _param_field(gr, key: str, value: Any, default: Any):
     elif kind is int:
         comp = gr.Number(value, label=key, info=info, precision=0, min_width=160)
     elif kind is float:
-        comp = gr.Number(value, label=key, info=info, min_width=160)
+        # arrows / mouse wheel move by a tenth of the default's order of magnitude
+        # (tau 0.95 -> 0.01, lambda 10 -> 1, lambda_l1 1e-4 -> 1e-5) instead of the default 1
+        ref = abs(default if isinstance(default, (int, float)) and default else 0.1)
+        step = 10 ** (math.floor(math.log10(ref)) - 1)
+        comp = gr.Number(value, label=key, info=info, min_width=160, step=float(f"{step:.0e}"))
     elif kind is str:
         comp = gr.Textbox(value, label=key, info=info, min_width=200)
     else:                                      # None / list / dict -> JSON
@@ -1509,10 +1555,18 @@ def _param_updater(algo: str, key: str, kind: type):
     return update
 
 
-def launch(**kwargs):
-    """Build and launch the GUI. In Colab, Gradio shows it inline in the cell."""
+def launch(data_dir: Optional[str] = None, runs_dir: Optional[str] = None,
+           num_workers: Optional[int] = None, **kwargs):
+    """Build and launch the GUI.
+
+    ``data_dir`` / ``runs_dir`` / ``num_workers`` become the defaults of the download
+    folder, output/runs folder and DataLoader workers, also after loading a preset
+    (on Colab: the Google Drive folders and 2 workers).
+    """
     import gradio as gr
 
+    ENV_DEFAULTS.update(data_dir=data_dir, runs_dir=runs_dir, num_workers=num_workers)
+    print(f"[ssfl] SSFL Studio, build {code_version()}", flush=True)
     app = build_app()
     app.queue(default_concurrency_limit=8)
     kwargs.setdefault("theme", gr.themes.Soft(**THEME_ARGS, font=[gr.themes.GoogleFont("Inter"),
@@ -1526,8 +1580,12 @@ def main(argv=None) -> None:
     p.add_argument("--port", type=int, default=7860)
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--share", action="store_true", help="create a public gradio.live link")
+    p.add_argument("--data-dir", help="default download folder")
+    p.add_argument("--runs-dir", help="default output / runs folder")
+    p.add_argument("--workers", type=int, help="default DataLoader workers")
     args = p.parse_args(argv)
-    launch(server_name=args.host, server_port=args.port, share=args.share)
+    launch(data_dir=args.data_dir, runs_dir=args.runs_dir, num_workers=args.workers,
+           server_name=args.host, server_port=args.port, share=args.share)
 
 
 if __name__ == "__main__":

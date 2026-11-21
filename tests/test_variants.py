@@ -166,3 +166,25 @@ def test_results_table_latex_and_partial_runs():
     assert r"\caption{Best acc (\%) \& more\_info}" in tex
     assert r"organamnist 5\%" in tex and r"\textbf{60.00}" in tex
     assert tex.count(r"\\") == 3                                   # header + 2 rows
+
+
+def test_gui_env_defaults_and_version():
+    pytest.importorskip("gradio")
+    from ssfl import gui
+    gui.ENV_DEFAULTS.update(data_dir="/drive/data", runs_dir="/drive/runs", num_workers=2)
+    try:
+        cfg = gui.apply_env(gui.load_preset("quick_test.yaml"))
+        assert (cfg.data.root, cfg.output_dir, cfg.data.num_workers) == ("/drive/data", "/drive/runs", 2)
+        gui.build_app()
+    finally:
+        gui.ENV_DEFAULTS.clear()
+    assert gui.code_version()
+
+
+def test_same_name_same_second_gets_its_own_folder(tmp_path):
+    cfg = cfg_for(tmp_path, **{"strategy.name": "fedavg", "server.rounds": 1})
+    first = Experiment(cfg, verbose=False)
+    first.out_dir.mkdir(parents=True)                        # as if it had just started
+    second = Experiment(cfg, verbose=False)
+    assert second.out_dir != first.out_dir
+    assert second.out_dir.name.startswith(first.out_dir.name)

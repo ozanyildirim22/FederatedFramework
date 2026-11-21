@@ -68,6 +68,10 @@ class Experiment:
 
         stamp = time.strftime("%Y%m%d-%H%M%S")
         self.out_dir = Path(cfg.output_dir) / f"{cfg.name}_{stamp}"
+        n = 2
+        while self.out_dir.exists():           # same name started within the same second
+            self.out_dir = Path(cfg.output_dir) / f"{cfg.name}_{stamp}-{n}"
+            n += 1
 
     @classmethod
     def from_yaml(cls, path, overrides=None, **kw) -> "Experiment":

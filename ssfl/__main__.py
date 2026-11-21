@@ -22,6 +22,9 @@ def main(argv=None) -> None:
     p.add_argument("--list", action="store_true", help="list registered components and exit")
     p.add_argument("--gui", action="store_true", help="open the graphical interface")
     p.add_argument("--share", action="store_true", help="with --gui: public gradio.live link")
+    p.add_argument("--data-dir", help="with --gui: default download folder (e.g. on Google Drive)")
+    p.add_argument("--runs-dir", help="with --gui: default output / runs folder")
+    p.add_argument("--workers", type=int, help="with --gui: default DataLoader workers")
     p.add_argument("--grid", metavar="YAML", help="run a grid of experiments (see ssfl/grid.py)")
     p.add_argument("--only", nargs="*", default=[], metavar="TEXT",
                    help="with --grid: only runs whose name contains every TEXT")
@@ -36,7 +39,7 @@ def main(argv=None) -> None:
         return
     if args.gui:
         from .gui import launch
-        launch(share=args.share)
+        launch(share=args.share, data_dir=args.data_dir, runs_dir=args.runs_dir, num_workers=args.workers)
         return
     if args.grid:
         from .grid import run_grid

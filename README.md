@@ -65,7 +65,10 @@ python -m ssfl --gui          # opens http://127.0.0.1:7860
 * **🏆 Results** — leaderboard, curves of any metric, and the **thesis table**
   (best accuracy per algorithm × dataset × label ratio) with CSV and LaTeX download.
 * **📘 Guide** — what every algorithm does and how to use the studio.
-* In Colab: `from ssfl.gui import launch; launch(share=True)` shows the GUI inside the notebook.
+* In Colab, run the notebook's GUI cell:
+  `!python -m ssfl --gui --share --data-dir "{DATA_DIR}" --runs-dir "{RUNS_DIR}" --workers 2`.
+  It starts the GUI as a fresh process (always the latest cloned code) and prints a public
+  `gradio.live` link. The **build** chip in the header shows the git commit the GUI runs.
 
 ## Run
 
