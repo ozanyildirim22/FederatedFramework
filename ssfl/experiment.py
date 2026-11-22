@@ -1,6 +1,7 @@
 """Experiment: wires the three tiers together and runs the federated loop."""
 from __future__ import annotations
 
+import copy
 import csv
 import json
 import random
@@ -17,6 +18,7 @@ from .config import ExperimentConfig
 from .data import DataManager
 from .models import build_model
 from .registry import AGGREGATORS, STRATEGIES
+from .runinfo import environment, full_params
 from .server import Server
 
 Callback = Callable[[int, Dict[str, float], "Experiment"], None]
@@ -44,6 +46,7 @@ class Experiment:
 
     def __init__(self, cfg: ExperimentConfig, callbacks: Optional[List[Callback]] = None,
                  verbose: bool = True):
+        t_setup = time.time()
         self.cfg = cfg
         self.callbacks = list(callbacks or [])
         self.verbose = verbose
@@ -68,6 +71,7 @@ class Experiment:
         self.test_loader = self.data.test_loader()
         self.strategy.setup(self)
         self.history: List[Dict[str, float]] = []
+        self.setup_s = time.time() - t_setup           # data loading, partitioning, model building
 
         stamp = time.strftime("%Y%m%d-%H%M%S")
         self.out_dir = Path(cfg.output_dir) / f"{cfg.name}_{stamp}"
@@ -106,9 +110,60 @@ class Experiment:
         rec["time_s"] = time.time() - t0
         return rec
 
+    # ---------------------------------------------------------- bookkeeping
+    def resolved_config(self) -> ExperimentConfig:
+        """The config with every strategy / aggregator parameter written out, defaults
+        included, so ``config.yaml`` alone reproduces the run."""
+        cfg = copy.deepcopy(self.cfg)
+        cfg.strategy.params = full_params(STRATEGIES.get(cfg.strategy.name), cfg.strategy.params)
+        cfg.server.params = full_params(AGGREGATORS.get(cfg.server.aggregator), cfg.server.params)
+        return cfg
+
+    def _write_summary(self, status: str) -> None:
+        """``summary.json``: status, timing, best / final metrics and environment. Written
+        after every round, so stopped or crashed runs keep their timing too."""
+        now = time.time()
+        acc = [(r["test_acc"], int(r["round"])) for r in self.history if "test_acc" in r]
+        best = max(acc, default=(None, None))
+        times = [r["time_s"] for r in self.history if "time_s" in r]
+        summary = {
+            "name": self.cfg.name,
+            "status": status,                         # running | finished | stopped | error
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self._t_start)),
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
+            "rounds_done": len(self.history),
+            "rounds_planned": self.cfg.server.rounds,
+            "setup_s": round(self.setup_s, 2),
+            "train_s": round(sum(times), 2),
+            "elapsed_s": round(now - self._t_start + self.setup_s, 2),
+            "mean_round_s": round(sum(times) / len(times), 3) if times else None,
+            "best_test_acc": best[0],
+            "best_round": best[1],
+            "final": self.history[-1] if self.history else {},
+            "num_workers": self.num_workers,
+            "precision": self.server.precision,
+            "augment_device": self.cfg.data.augment_device,
+            "data_summary": self.data.summary(),
+            "environment": self._env,
+        }
+        tmp = self.out_dir / "summary.json.tmp"
+        tmp.write_text(json.dumps(summary, indent=2))
+        tmp.replace(self.out_dir / "summary.json")
+
     def run(self) -> List[Dict[str, float]]:
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        self.cfg.save(self.out_dir / "config.yaml")
+        self.resolved_config().save(self.out_dir / "config.yaml")
+        self._t_start = time.time()
+        self._env = environment(self.device)
+        try:
+            return self._run()
+        except BaseException as e:                     # stopped from the GUI, Ctrl+C, crash
+            if self.history:
+                self._write_summary("stopped" if type(e).__name__ in ("_Stopped", "KeyboardInterrupt")
+                                    else "error")
+            raise
+
+    def _run(self) -> List[Dict[str, float]]:
         self.log(f"[ssfl] {self.data.summary()}")
         self.log(f"[ssfl] strategy={self.cfg.strategy.name} aggregator={self.cfg.server.aggregator} "
                  f"model={self.cfg.model.name} device={self.device} "
@@ -128,14 +183,14 @@ class Experiment:
             if "test_acc" in rec:
                 msg += f" | test_acc {rec['test_acc']:.4f}"
             self.log(msg + f" | {rec['time_s']:.1f}s")
+            self._write_summary("running")
             for cb in self.callbacks:
                 cb(rnd, rec, self)
 
         torch.save(self.server.global_state, self.out_dir / "global_model.pt")
+        self._write_summary("finished")
         best = max((r["test_acc"] for r in self.history if "test_acc" in r), default=None)
-        summary = {"final": self.history[-1], "best_test_acc": best}
-        (self.out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
-        self.log(f"[ssfl] done. best test_acc={best}")
+        self.log(f"[ssfl] done. best test_acc={best} | {time.time() - self._t_start:.0f}s")
         return self.history
 
     def _write_csv(self) -> None:

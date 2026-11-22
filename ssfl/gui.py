@@ -21,7 +21,6 @@ from __future__ import annotations
 import argparse
 import copy
 import html
-import inspect
 import json
 import math
 import re
@@ -37,12 +36,12 @@ import pandas as pd
 import yaml
 
 from .config import ExperimentConfig
+from .runinfo import code_version, default_params  # noqa: F401 - re-exported for plug-ins / tests
 from .registry import AGGREGATORS, DATASETS, MODELS, PARTITIONERS, STRATEGIES
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = PROJECT_ROOT / "configs"
 GRID_DIR = CONFIG_DIR / "grids"
-SKIP_ARGS = {"self", "cfg", "num_classes"}
 
 # ------------------------------------------------------------ catalogue
 #: name -> (display name, venue, one-line description, kind)
@@ -139,21 +138,6 @@ def preset_choices(presets: Sequence[str]) -> List[Tuple[str, str]]:
 
 
 # --------------------------------------------------------------- helpers
-def default_params(cls) -> Dict[str, Any]:
-    """Collect keyword defaults from a class' ``__init__`` along its MRO."""
-    out: Dict[str, Any] = {}
-    for klass in getattr(cls, "__mro__", [cls]):
-        init = klass.__dict__.get("__init__")
-        if init is None:
-            continue
-        for name, p in inspect.signature(init).parameters.items():
-            if name in SKIP_ARGS or p.kind in (p.VAR_KEYWORD, p.VAR_POSITIONAL):
-                continue
-            if p.default is not inspect.Parameter.empty and name not in out:
-                out[name] = p.default
-    return out
-
-
 def list_presets() -> List[str]:
     return sorted(p.name for p in CONFIG_DIR.glob("*.yaml")) if CONFIG_DIR.exists() else []
 
@@ -267,21 +251,6 @@ def _fmt_secs(s: float) -> str:
     if s >= 60:
         return f"{s // 60}m {s % 60:02d}s"
     return f"{s}s"
-
-
-def code_version() -> str:
-    """Short git commit of the running code (shown in the header, printed at launch),
-    so it is easy to tell whether a GUI runs the latest pulled version."""
-    import subprocess
-    try:
-        out = subprocess.run(["git", "-C", str(PROJECT_ROOT), "log", "-1", "--format=%h %cd",
-                              "--date=format:%Y-%m-%d %H:%M"], capture_output=True, text=True, timeout=5)
-        if out.returncode == 0 and out.stdout.strip():
-            return out.stdout.strip()
-    except Exception:  # noqa: BLE001 - git missing, not a checkout, ...
-        pass
-    from . import __version__
-    return f"v{__version__}"
 
 
 #: Environment defaults (set by ``launch(data_dir=..., runs_dir=..., num_workers=...)``, e.g. the
@@ -532,7 +501,7 @@ def render_status(snap) -> str:
 
 
 def _kpi(label: str, value: str, sub: str = "", accent: str = "") -> str:
-    return (f'<div class="kpi {accent}"><div class="kpi-label">{label}</div>'
+    return (f'<div class="kpi {accent}"><div class="kpi-label">{label.upper()}</div>'
             f'<div class="kpi-value">{value}</div><div class="kpi-sub">{sub}</div></div>')
 
 
@@ -709,57 +678,239 @@ def render_guide() -> str:
 RUN_STAMP = r"_\d{8}-\d{6}(?:-\d+)?$"
 
 
+def _read_yaml(path: Path) -> Dict[str, Any]:
+    try:
+        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001 - missing / half-written
+        return {}
+
+
+def _read_json(path: Path) -> Dict[str, Any]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _started_from_name(name: str) -> str:
+    m = re.search(r"_(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})(?:-\d+)?$", name)
+    return f"{m[1]}-{m[2]}-{m[3]} {m[4]}:{m[5]}" if m else ""
+
+
 def _run_meta(run_dir: Path) -> Dict[str, Any]:
-    cfg = {}
-    if (run_dir / "config.yaml").exists():
-        cfg = yaml.safe_load((run_dir / "config.yaml").read_text(encoding="utf-8")) or {}
+    cfg = _read_yaml(run_dir / "config.yaml")
+    summ = _read_json(run_dir / "summary.json")
     base = re.sub(RUN_STAMP, "", run_dir.name)
     m = re.search(r"_l[0-9p]+_(.+)$", base)
     algo = cfg.get("strategy", {}).get("name", "?")
-    return {"run": run_dir.name, "base": base, "dataset": cfg.get("data", {}).get("dataset", "?"),
-            "labels": cfg.get("data", {}).get("labeled_ratio"), "alpha": cfg.get("data", {}).get("alpha"),
+    data, server, strat = cfg.get("data", {}), cfg.get("server", {}), cfg.get("strategy", {})
+    return {"run": run_dir.name, "base": base, "dataset": data.get("dataset", "?"),
+            "labels": data.get("labeled_ratio"), "alpha": data.get("alpha"),
+            "clients": server.get("num_clients"), "fraction": server.get("client_fraction"),
             "algorithm": algo, "variant": algo_label(algo) + (f" ({m.group(1)})" if m else ""),
-            "aggregator": cfg.get("server", {}).get("aggregator"),
-            "planned_rounds": cfg.get("server", {}).get("rounds")}
+            "aggregator": server.get("aggregator"), "model": cfg.get("model", {}).get("name"),
+            "planned_rounds": server.get("rounds"),
+            "fast": data.get("augment_device") == "gpu" or strat.get("precision") in ("bf16", "fp16"),
+            "started": (summ.get("started_at") or "")[:16] or _started_from_name(run_dir.name),
+            "summary": summ, "config": cfg}
+
+
+def _status(meta: Dict[str, Any]) -> str:
+    """finished | stopped | error | running | interrupted (a "running" run that stopped
+    writing, e.g. a Colab session that disconnected) | partial (old runs without status)."""
+    summ = meta["summary"]
+    if not summ:
+        return "partial"
+    st = summ.get("status", "finished")
+    if st == "running":
+        per_round = summ.get("mean_round_s") or 60
+        if time.time() - meta["mtime"] > max(600, 5 * per_round):
+            return "interrupted"
+    return st
+
+
+STATUS_LABEL = {"finished": "✓ finished", "running": "▶ running", "stopped": "■ stopped",
+                "error": "✗ error", "interrupted": "⚠ interrupted", "partial": "… partial"}
 
 
 def scan_runs(runs_dir: str) -> List[Dict[str, Any]]:
     root = Path(runs_dir)
     if not root.exists():
         return []
-    out = []
-    for csv_path in root.glob("*/metrics.csv"):
-        meta = _run_meta(csv_path.parent)
-        try:
-            df = pd.read_csv(csv_path)
-        except Exception:  # noqa: BLE001 - half-written file
-            continue
-        meta["rounds"] = int(df["round"].max()) if len(df) else 0
-        acc = df["test_acc"].dropna() if "test_acc" in df else pd.Series(dtype=float)
-        meta["best_acc"] = float(acc.max()) if len(acc) else None
-        meta["final_acc"] = float(acc.iloc[-1]) if len(acc) else None
-        meta["finished"] = (csv_path.parent / "summary.json").exists()
-        meta["mtime"] = csv_path.stat().st_mtime
-        out.append(meta)
+    out = [m for m in (load_run(p.parent) for p in root.glob("*/metrics.csv")) if m is not None]
     return sorted(out, key=lambda m: m["mtime"], reverse=True)
 
 
+def load_run(run_dir: Path) -> Optional[Dict[str, Any]]:
+    """Everything the Results tab shows about one run folder (None if unreadable)."""
+    csv_path = Path(run_dir) / "metrics.csv"
+    meta = _run_meta(Path(run_dir))
+    try:
+        df = pd.read_csv(csv_path)
+        meta["mtime"] = csv_path.stat().st_mtime
+    except Exception:  # noqa: BLE001 - missing / half-written file
+        return None
+    meta["rounds"] = int(df["round"].max()) if len(df) else 0
+    acc = df["test_acc"].dropna() if "test_acc" in df else pd.Series(dtype=float)
+    meta["best_acc"] = float(acc.max()) if len(acc) else None
+    meta["final_acc"] = float(acc.iloc[-1]) if len(acc) else None
+    last = df.iloc[-1] if len(df) else {}
+    meta["mask"] = float(last["train_mask_rate"]) if "train_mask_rate" in df and last["train_mask_rate"] == last["train_mask_rate"] else None
+    meta["pl_acc"] = float(df["train_pl_acc"].dropna().iloc[-1]) if "train_pl_acc" in df and df["train_pl_acc"].notna().any() else None
+    times = df["time_s"].dropna() if "time_s" in df else pd.Series(dtype=float)
+    summ = meta["summary"]
+    meta["time_s"] = summ.get("elapsed_s") or (float(times.sum()) if len(times) else None)
+    meta["round_s"] = summ.get("mean_round_s") or (float(times.mean()) if len(times) else None)
+    meta["status"] = _status(meta)
+    meta["finished"] = meta["status"] == "finished"
+    return meta
+
+
+def _pct(v) -> str:
+    return f"{100 * v:.2f}" if v is not None and v == v else "—"
+
+
 def leaderboard(runs: List[Dict[str, Any]]) -> pd.DataFrame:
+    cols = ["#", "run", "started", "dataset", "labels", "α", "clients", "algorithm", "best acc",
+            "final acc", "rounds", "time", "s/round", "status"]
     if not runs:
-        return pd.DataFrame(columns=["#", "run", "dataset", "labels", "algorithm", "best acc", "final acc",
-                                     "rounds", "status"])
-    df = pd.DataFrame(runs).sort_values("best_acc", ascending=False, na_position="last")
+        return pd.DataFrame(columns=cols)
+    df = pd.DataFrame(runs).sort_values("best_acc", ascending=False, na_position="last", kind="mergesort")
     out = pd.DataFrame({
-        "run": df["run"], "dataset": df["dataset"],
+        "run": df["base"], "started": df["started"], "dataset": df["dataset"],
         "labels": df["labels"].map(lambda v: f"{100 * v:g}%" if v is not None and v == v else ""),
-        "algorithm": df["variant"],
-        "best acc": df["best_acc"].map(lambda v: f"{100 * v:.2f}" if v is not None and v == v else "—"),
-        "final acc": df["final_acc"].map(lambda v: f"{100 * v:.2f}" if v is not None and v == v else "—"),
+        "α": df["alpha"].map(lambda v: f"{v:g}" if v is not None and v == v else ""),
+        "clients": [f"{n}×{c:g}" if n and c else (str(n) if n else "") for n, c in zip(df["clients"], df["fraction"])],
+        "algorithm": df["variant"] + df["fast"].map(lambda f: " ⚡" if f else ""),
+        "best acc": df["best_acc"].map(_pct), "final acc": df["final_acc"].map(_pct),
         "rounds": [f"{r}/{p}" if p else str(r) for r, p in zip(df["rounds"], df["planned_rounds"])],
-        "status": df["finished"].map(lambda f: "✓ finished" if f else "… partial"),
+        "time": df["time_s"].map(lambda v: _fmt_secs(v) if v is not None and v == v else "—"),
+        "s/round": df["round_s"].map(lambda v: f"{v:.1f}" if v is not None and v == v else "—"),
+        "status": df["status"].map(lambda s: STATUS_LABEL.get(s, s)),
     })
     out.insert(0, "#", range(1, len(out) + 1))
-    return out
+    return out[cols].reset_index(drop=True)
+
+
+def board_order(runs: List[Dict[str, Any]]) -> List[str]:
+    """Run folders in the leaderboard's row order (same stable sort)."""
+    return [r["run"] for r in sorted(runs, key=lambda r: (r["best_acc"] is None, -(r["best_acc"] or 0)))]
+
+
+def run_choices(runs: List[Dict[str, Any]]) -> List[Tuple[str, str]]:
+    return [(f"{r['base']} · {r['started']} · best {_pct(r['best_acc'])}%", r["run"]) for r in runs]
+
+
+def _fmt_val(v: Any) -> str:
+    if isinstance(v, float):
+        return f"{v:g}"
+    if v is None:
+        return "—"
+    if isinstance(v, (list, dict)):
+        return json.dumps(v)
+    return str(v)
+
+
+def _rows(pairs: Sequence[Tuple[str, Any]]) -> str:
+    return "".join(f"<tr><td>{html.escape(k)}</td><td>{html.escape(_fmt_val(v))}</td></tr>" for k, v in pairs)
+
+
+def _param_rows(cls, given: Dict[str, Any]) -> str:
+    """Every parameter with its value; values that differ from the default are highlighted."""
+    defaults = default_params(cls) if cls is not None else {}
+    keys = list(defaults) + [k for k in (given or {}) if k not in defaults]
+    out = []
+    for k in keys:
+        val = (given or {}).get(k, defaults.get(k))
+        changed = k in (given or {}) and k in defaults and given[k] != defaults[k]
+        note = f'<span class="dflt">default {html.escape(_fmt_val(defaults[k]))}</span>' if changed else ""
+        out.append(f'<tr class="{"chg" if changed else ""}"><td>{html.escape(k)}</td>'
+                   f"<td>{html.escape(_fmt_val(val))}{note}</td></tr>")
+    return "".join(out) or '<tr><td colspan="2">no parameters</td></tr>'
+
+
+def render_run_details(meta: Dict[str, Any], run_dir: Path) -> str:
+    cfg, summ = meta["config"], meta["summary"]
+    data, model, strat, server = (cfg.get(k, {}) for k in ("data", "model", "strategy", "server"))
+    env = summ.get("environment", {})
+    status = meta["status"]
+    best_round = summ.get("best_round")
+    head = (f'<div class="dhead"><div><h3>{html.escape(meta["base"])}</h3>'
+            f'<div class="muted">{html.escape(meta["variant"])} · {html.escape(meta["dataset"])} · '
+            f'started {html.escape(meta["started"] or "?")}'
+            + (f' · last update {html.escape(summ["updated_at"][:16])}' if summ.get("updated_at") else "")
+            + f'</div></div><span class="badge b-{status}">{STATUS_LABEL.get(status, status)}</span></div>')
+    kpis = ('<div class="kpi-grid">'
+            + _kpi("Best accuracy", f"{_pct(meta['best_acc'])}<span>%</span>",
+                   f"at round {best_round}" if best_round else "", "a1")
+            + _kpi("Final accuracy", f"{_pct(meta['final_acc'])}<span>%</span>",
+                   f"round {meta['rounds']} of {meta['planned_rounds']}", "a2")
+            + _kpi("Total time", _fmt_secs(meta["time_s"]) if meta["time_s"] else "—",
+                   f"setup {_fmt_secs(summ['setup_s'])}" if summ.get("setup_s") is not None else "", "a3")
+            + _kpi("Per round", f"{meta['round_s']:.1f}<span>s</span>" if meta["round_s"] else "—",
+                   "training + evaluation", "a4")
+            + _kpi("Pseudo-labels", f"{_pct(meta['mask'])}<span>%</span>" if meta["mask"] is not None else "—",
+                   f"used · {_pct(meta['pl_acc'])}% correct" if meta["pl_acc"] is not None else "used (last round)",
+                   "a5") + "</div>")
+    lr = strat.get("local_steps") or f"{strat.get('local_epochs', 1)} epoch(s)"
+    cards = [
+        ("🗂️ Data", _rows([("dataset", data.get("dataset")), ("labeled per client", data.get("labeled_ratio")),
+                           ("partitioner", data.get("partitioner")), ("Dirichlet α", data.get("alpha")),
+                           ("image size", data.get("image_size")), ("labeled batch", data.get("batch_size")),
+                           ("unlabeled ratio μ", data.get("unlabeled_batch_ratio")),
+                           ("strong augmentation", data.get("strong_aug")),
+                           ("augmentation on", data.get("augment_device", "cpu")),
+                           ("DataLoader workers", summ.get("num_workers", data.get("num_workers")))])),
+        ("🌐 Federation", _rows([("clients N", server.get("num_clients")), ("clients per round C", server.get("client_fraction")),
+                                 ("rounds", f"{meta['rounds']} / {server.get('rounds')}"),
+                                 ("aggregator", server.get("aggregator")), ("evaluate every", server.get("eval_every")),
+                                 ("seed", cfg.get("seed"))])),
+        ("🧠 Local training", _rows([("model", model.get("name")), ("normalisation", model.get("norm")),
+                                     ("optimizer", strat.get("optimizer")), ("learning rate", strat.get("lr")),
+                                     ("momentum", strat.get("momentum")), ("weight decay", strat.get("weight_decay")),
+                                     ("local work", lr), ("grad clip", strat.get("grad_clip")),
+                                     ("extra FedProx μ", strat.get("prox_mu")),
+                                     ("precision", summ.get("precision", strat.get("precision", "fp32"))),
+                                     ("channels_last", strat.get("channels_last", False))])),
+        (f"🎛️ {html.escape(algo_label(meta['algorithm']))} parameters",
+         _param_rows(STRATEGIES.get(meta["algorithm"]) if meta["algorithm"] in STRATEGIES else None,
+                     strat.get("params", {}))),
+        (f"🖥️ Aggregator ({html.escape(str(server.get('aggregator')))})",
+         _param_rows(AGGREGATORS.get(server["aggregator"]) if server.get("aggregator") in AGGREGATORS else None,
+                     server.get("params", {}))),
+        ("💻 Environment", _rows([("GPU", f"{env['gpu']} · {env.get('gpu_memory_gb', '?')} GB" if env.get("gpu")
+                                   else env.get("device", "not recorded")),
+                                  ("PyTorch", env.get("torch")), ("Python", env.get("python")),
+                                  ("SSFL build", env.get("code")), ("system", env.get("platform")),
+                                  ("folder", str(run_dir))])),
+    ]
+    body = "".join(f'<div class="dcard"><div class="dtitle">{t}</div><table>{rows}</table></div>' for t, rows in cards)
+    note = ""
+    if not summ:
+        note = ('<div class="muted small">This run was made with an older version: timing, hardware and '
+                'default parameters were not recorded.</div>')
+    return f'<div class="details">{head}{kpis}<div class="dgrid">{body}</div>{note}</div>'
+
+
+def detail_frames(run_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    try:
+        df = pd.read_csv(run_dir / "metrics.csv")
+    except Exception:  # noqa: BLE001
+        return _typed([], "series"), _typed([], "series")
+
+    def frame(cols):
+        rows = []
+        for col, label in cols:
+            if col in df:
+                d = df.dropna(subset=[col])
+                rows += [{"round": int(r), "value": float(v), "series": label} for r, v in zip(d["round"], d[col])]
+        return _typed(rows, "series")
+
+    acc = frame([("test_acc", "test accuracy"), ("train_pl_acc", "pseudo-label accuracy"),
+                 ("train_mask_rate", "pseudo-label mask")])
+    loss = frame([(c, c.replace("train_loss_", "").replace("train_", "").replace("_", " "))
+                  for c in df.columns if c.startswith("train_loss")] + [("test_loss", "test loss")])
+    return acc, loss
 
 
 def thesis_table(runs: List[Dict[str, Any]]) -> pd.DataFrame:
@@ -1020,7 +1171,7 @@ footer { display:none !important; }
   opacity:.14; background: var(--kc, var(--ss-a)); }
 .kpi.a1 { --kc:#6366f1; } .kpi.a2 { --kc:#d946ef; } .kpi.a3 { --kc:#10b981; } .kpi.a4 { --kc:#f59e0b; }
 .kpi.a5 { --kc:#0ea5e9; }
-.kpi-label { font-size:11.5px; font-weight:700; text-transform:uppercase; letter-spacing:.05em; opacity:.6; }
+.kpi-label { font-size:11.5px; font-weight:700; letter-spacing:.05em; opacity:.6; }
 .kpi-value { font-size:26px; font-weight:800; letter-spacing:-.02em; margin-top:2px; color: var(--kc); }
 .kpi-value span { font-size:15px; margin-left:1px; opacity:.8; }
 .kpi-sub { font-size:12px; opacity:.6; min-height:16px; }
@@ -1036,6 +1187,25 @@ footer { display:none !important; }
 .algo-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(280px,1fr)); gap:10px; }
 .tips li { margin:4px 0; font-size:14px; }
 .param-group { border-radius:14px !important; }
+/* run details */
+.details .dhead { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; margin:4px 0 12px; }
+.details h3 { margin:0 !important; font-size:18px !important; word-break:break-all; }
+.badge { font-size:12px; font-weight:700; padding:4px 10px; border-radius:999px; white-space:nowrap;
+  border:1px solid var(--border-color-primary); }
+.b-finished { color:#059669; border-color:#10b981; background:rgba(16,185,129,.08); }
+.b-running { color:var(--ss-a); border-color:var(--ss-a); }
+.b-stopped, .b-interrupted, .b-partial { color:#b45309; border-color:#f59e0b; background:rgba(245,158,11,.08); }
+.b-error { color:var(--ss-err); border-color:var(--ss-err); }
+.dgrid { display:grid; grid-template-columns: repeat(auto-fill, minmax(300px,1fr)); gap:10px; margin-top:12px; }
+.dcard { border-radius:14px; padding:12px 14px; border:1px solid var(--border-color-primary);
+  background:var(--block-background-fill); }
+.dtitle { font-weight:700; margin-bottom:6px; }
+.dcard table { width:100%; border-collapse:collapse; font-size:13px; }
+.dcard td { padding:4px 4px; border-top:1px solid var(--border-color-primary); vertical-align:top; }
+.dcard td:first-child { opacity:.7; width:46%; }
+.dcard td:last-child { font-family: var(--font-mono); word-break:break-all; }
+.dcard tr.chg td:last-child { color:var(--ss-a); font-weight:700; }
+.dflt { display:block; font-weight:400; opacity:.6; font-size:11px; }
 .busy { display:flex; align-items:center; gap:12px; flex-wrap:wrap; border-radius:14px; padding:14px 16px;
   border:1px solid var(--border-color-primary); background:var(--block-background-fill); font-size:14px; }
 .busy.err { border-color:var(--ss-err); display:block; }
@@ -1092,7 +1262,7 @@ def build_app():
         gr.HTML(render_hero())
         params_state = gr.State(start_params)
 
-        with gr.Tabs():
+        with gr.Tabs() as main_tabs:
             # ======================================================== EXPERIMENT
             with gr.Tab("🧪 Experiment", id="experiment"):
                 with gr.Row(equal_height=False):
@@ -1129,8 +1299,8 @@ def build_app():
                                      "(T4, laptops) it gains little. Same augmentations, but not bit-identical "
                                      "to the CPU pipeline: keep it off to reproduce earlier runs.")
                         with gr.Accordion("🎛️  Algorithm parameters", open=False):
-                            gr.Markdown("Defaults come from the papers. Only the values you change are "
-                                        "written to the config.", elem_classes="muted")
+                            gr.Markdown("Defaults come from the papers. Each run's `config.yaml` records "
+                                        "every value it used, defaults included.", elem_classes="muted")
 
                             # One static form per registered algorithm, shown only when the algorithm
                             # is ticked. (Static components are robust behind proxies such as Colab /
@@ -1303,15 +1473,32 @@ def build_app():
                     metric = gr.Dropdown([(lab, k) for k, lab in METRIC_LABELS.items()], value="test_acc",
                                          label="Metric to plot", scale=2)
                 res_kpis = gr.HTML("")
-                with gr.Tabs():
-                    with gr.Tab("🥇  Leaderboard"):
-                        board = gr.Dataframe(leaderboard([]), wrap=True, max_height=420)
-                    with gr.Tab("📈  Curves"):
+                board_runs = gr.State([])                  # run folders in leaderboard row order
+                with gr.Tabs() as res_tabs:
+                    with gr.Tab("🥇  Leaderboard", id="board"):
+                        gr.Markdown("Click a row to open its details. ⚡ = Fast GPU mode.", elem_classes="muted")
+                        board = gr.Dataframe(leaderboard([]), wrap=False, max_height=460, interactive=False)
+                    with gr.Tab("🔍  Run details", id="details", render_children=True):
+                        detail_pick = gr.Dropdown([], value=None, label="Run", info="newest first")
+                        detail_html = gr.HTML('<div class="algo-info empty">Pick a run, or click a row in the '
+                                              'leaderboard.</div>')
+                        with gr.Row():
+                            detail_acc = gr.LinePlot(_typed([], "series"), x="round", y="value", color="series",
+                                                     title="Accuracy and pseudo-labels", y_lim=[0, 1],
+                                                     y_title="rate", color_title=" ", height=300)
+                            detail_loss = gr.LinePlot(_typed([], "series"), x="round", y="value", color="series",
+                                                      title="Losses", y_title="loss", color_title=" ", height=300)
+                        with gr.Row():
+                            load_btn = gr.Button("↻  Load these settings into Experiment", variant="primary")
+                            dl_run_cfg = gr.DownloadButton("⬇  config.yaml", value=None)
+                            dl_run_metrics = gr.DownloadButton("⬇  metrics.csv", value=None)
+                            dl_run_summary = gr.DownloadButton("⬇  summary.json", value=None)
+                    with gr.Tab("📈  Curves", id="curves"):
                         run_select = gr.Dropdown([], value=[], multiselect=True,
                                                  label="Runs to plot (top 5 are pre-selected)")
                         curve_plot = gr.LinePlot(_typed([]), x="round",
                                                  y="value", color="run", height=380)
-                    with gr.Tab("🎓  Thesis table"):
+                    with gr.Tab("🎓  Thesis table", id="thesis"):
                         gr.Markdown("Best test accuracy (%) per algorithm and setting, from finished runs "
                                     "(latest run of each name). Bold in LaTeX = best in column; the "
                                     "table uses the `booktabs` package.")
@@ -1365,13 +1552,15 @@ def build_app():
                   show_progress="hidden", concurrency_limit=1, concurrency_id="param-state",
                   trigger_mode="always_last" if kind in (int, float) else "multiple")
 
-        def on_preset(p):
-            cfg = apply_env(load_preset(p))
+        def form_from_cfg(cfg):
             vals = cfg_to_values(cfg)
             vals[0] = ""                                  # auto run name
             state = {cfg.strategy.name: dict(cfg.strategy.params)}
             return (*vals, [cfg.strategy.name], state, render_algo_cards([cfg.strategy.name]),
                     _is_fast(dict(zip(FIELDS, vals))), *param_values(state))
+
+        def on_preset(p):
+            return form_from_cfg(apply_env(load_preset(p)))
 
         # `.input` fires only on user edits, so loading a preset keeps its tuned params.
         preset.input(on_preset, preset, components + [algos, params_state, algo_info, fast] + param_comps,
@@ -1481,6 +1670,7 @@ def build_app():
             yield (gr.update(color_map={**color_map(frame, "class"), "​": "#000000"}),
                    gr.update(), gr.update(), gr.update())
 
+        on_preview.__annotations__["request"] = gr.Request
         preview_btn.click(on_preview, cfg_inputs, [part_plot, part_stats, notice, dash_tabs],
                           show_progress="hidden", trigger_mode="multiple")
 
@@ -1497,20 +1687,38 @@ def build_app():
             banner (first output) once a second in between, so the elapsed time keeps
             counting while nothing else happens, e.g. while data loads."""
             last, n_out, last_tick = -1, None, 0.0
+            series: Dict[int, frozenset] = {}         # output index -> series names drawn so far
+
+            def full(snap):
+                """The view, then (if a chart got a new series) a colour-map re-send: the
+                charts fix their colour scale when they are first drawn, so a series that
+                arrives later stays uncoloured until the chart is redrawn."""
+                out = view(snap)
+                yield out
+                changed = {}
+                for i, o in enumerate(out):
+                    cmap = o.get("color_map") if isinstance(o, dict) else None
+                    if cmap and frozenset(cmap) != series.get(i):
+                        series[i] = frozenset(cmap)
+                        changed[i] = gr.update(color_map={**cmap, "​": "#000000"})
+                if changed:
+                    time.sleep(0.4)
+                    yield tuple(changed.get(i, gr.update()) for i in range(len(out)))
+
             while True:
                 snap = ctrl.snapshot()
                 if snap["kind"] == kind and snap["version"] != last:
                     last, last_tick = snap["version"], time.time()
-                    out = view(snap)
-                    n_out = len(out)
-                    yield out
+                    for out in full(snap):
+                        n_out = len(out)
+                        yield out
                 elif snap["kind"] == kind and n_out and time.time() - last_tick >= 1.0:
                     last_tick = time.time()
                     yield (render_status(snap), *[gr.update()] * (n_out - 1))
                 if not ctrl.running:
                     snap = ctrl.snapshot()
                     if snap["kind"] == kind and snap["version"] != last:
-                        yield view(snap)
+                        yield from full(snap)
                     return
                 time.sleep(0.5)
 
@@ -1546,9 +1754,7 @@ def build_app():
             if snap["kind"] != "experiment" or not snap["plan"]:
                 yield tuple(gr.update() for _ in exp_outputs)
                 return
-            yield exp_view(snap)
-            if ctrl.running:
-                yield from stream(exp_view, "experiment")
+            yield from stream(exp_view, "experiment")     # one update if finished, live if running
 
         # --------------------------------------------------------------- grid
         def grid_plan(path, only, extra, skip):
@@ -1618,9 +1824,7 @@ def build_app():
             if snap["kind"] != "grid" or not snap["plan"]:
                 yield tuple(gr.update() for _ in grid_outputs)
                 return
-            yield grid_view(snap)
-            if ctrl.running:
-                yield from stream(grid_view, "grid")
+            yield from stream(grid_view, "grid")
 
         # ------------------------------------------------------------ results
         def on_results(d, ds_filter, algo_filter, metric_key, keep_selection=None):
@@ -1652,11 +1856,56 @@ def build_app():
             return (gr.update(choices=datasets), gr.update(choices=algos_found),
                     gr.update(choices=names, value=chosen), board_df, thesis_df,
                     str(csv_path), str(tex_path), latex, kp, plot_update(run_curves(d, chosen, metric_key),
-                                                                 y_title=METRIC_LABELS.get(metric_key, metric_key)))
+                                                                 y_title=METRIC_LABELS.get(metric_key, metric_key)),
+                    board_order(sel), gr.update(choices=run_choices(sel)))
 
         res_inputs = [runs_dir, f_dataset, f_algo, metric]
         res_outputs = [f_dataset, f_algo, run_select, board, thesis, dl_csv, dl_tex, latex_view, res_kpis,
-                       curve_plot]
+                       curve_plot, board_runs, detail_pick]
+
+        # ------------------------------------------------------- run details
+        detail_outputs = [detail_html, detail_acc, detail_loss, dl_run_cfg, dl_run_metrics, dl_run_summary]
+
+        def on_detail(run, d):
+            if not run:
+                yield tuple(gr.update() for _ in detail_outputs)
+                return
+            run_dir = Path(d) / run
+            meta = load_run(run_dir)
+            if meta is None:
+                yield (_error_html(f"Cannot read {run_dir}"), *[gr.update()] * 5)
+                return
+            acc, loss = detail_frames(run_dir)
+            files = [str(run_dir / f) if (run_dir / f).exists() else None
+                     for f in ("config.yaml", "metrics.csv", "summary.json")]
+            yield (render_run_details(meta, run_dir), plot_update(acc, "series"), plot_update(loss, "series"),
+                   *files)
+            # colour scales are fixed when a chart is first drawn: re-send them now the data is in
+            time.sleep(0.4)
+            yield (gr.update(), *[gr.update(color_map={**color_map(f, "series"), "​": "#000000"})
+                                  for f in (acc, loss)], gr.update(), gr.update(), gr.update())
+
+        detail_pick.input(on_detail, [detail_pick, runs_dir], detail_outputs)
+
+        def on_board_select(runs, evt: gr.SelectData):
+            row = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
+            run = runs[row] if runs and 0 <= row < len(runs) else None
+            return gr.update(value=run), gr.Tabs(selected="details")
+
+        # string annotations (from __future__) cannot see the local `gr`: give Gradio the class
+        on_board_select.__annotations__["evt"] = gr.SelectData
+        board.select(on_board_select, board_runs, [detail_pick, res_tabs]).then(
+            on_detail, [detail_pick, runs_dir], detail_outputs)
+
+        def on_load_run(run, d):
+            if not run or not (Path(d) / run / "config.yaml").exists():
+                return (*[gr.update()] * (len(components) + 4 + len(param_comps)), gr.update())
+            cfg = ExperimentConfig.from_yaml(Path(d) / run / "config.yaml")
+            return (*form_from_cfg(cfg), gr.Tabs(selected="experiment"))
+
+        load_btn.click(on_load_run, [detail_pick, runs_dir],
+                       components + [algos, params_state, algo_info, fast] + param_comps + [main_tabs]).then(
+            show_yaml, cfg_inputs, yaml_view)
         refresh_btn.click(on_results, res_inputs, res_outputs)
         f_dataset.input(on_results, res_inputs, res_outputs)
         f_algo.input(on_results, res_inputs, res_outputs)

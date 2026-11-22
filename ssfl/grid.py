@@ -84,9 +84,21 @@ def expand_grid(path: str | Path, extra: Optional[Sequence[str]] = None
     return runs
 
 
+def run_finished(summary_path: Path) -> bool:
+    """A run folder is finished when its summary says so. Summaries from before the
+    ``status`` field were only written at the end, so they count as finished."""
+    import json
+    try:
+        return json.loads(summary_path.read_text()).get("status", "finished") == "finished"
+    except (OSError, ValueError):
+        return False
+
+
 def _finished(cfg: ExperimentConfig) -> bool:
     out = Path(cfg.output_dir)
-    return any(out.glob(f"{cfg.name}_*/summary.json")) if out.exists() else False
+    if not out.exists():
+        return False
+    return any(run_finished(p) for p in out.glob(f"{cfg.name}_*/summary.json"))
 
 
 def run_grid(path: str | Path, only: Sequence[str] = (), dry_run: bool = False,

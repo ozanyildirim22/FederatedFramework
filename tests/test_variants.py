@@ -263,3 +263,49 @@ def test_precision_options(tmp_path):
     with pytest.raises(ValueError):
         STRATEGIES.build("fedavg", cfg_for(tmp_path, **{"strategy.precision": "int8"}).strategy, 10
                          ).precision(torch.device("cpu"))
+
+
+def test_run_records_full_params_timing_and_status(tmp_path):
+    import json
+    import yaml
+    from ssfl.grid import run_finished
+    cfg = cfg_for(tmp_path, **{"strategy.name": "fedlabel", "strategy.params": {"tau": 0.7}})
+    exp = Experiment(cfg, verbose=False)
+    exp.run()
+    saved = yaml.safe_load((exp.out_dir / "config.yaml").read_text())
+    assert saved["strategy"]["params"]["tau"] == 0.7                        # the given value
+    assert saved["strategy"]["params"]["lambda_kl"] == 1.0                  # defaults written out too
+    assert "weight_by" in saved["server"]["params"]
+    assert cfg.strategy.params == {"tau": 0.7}                              # caller's config untouched
+    summ = json.loads((exp.out_dir / "summary.json").read_text())
+    assert summ["status"] == "finished" and summ["rounds_done"] == 3
+    assert summ["elapsed_s"] > 0 and summ["mean_round_s"] > 0 and "environment" in summ
+    assert run_finished(exp.out_dir / "summary.json")
+    # a run interrupted by a callback keeps a summary with status "stopped"
+    class _Stopped(Exception):
+        pass
+
+    def stop(rnd, rec, e):
+        raise _Stopped()
+    exp2 = Experiment(cfg, callbacks=[stop], verbose=False)
+    with pytest.raises(_Stopped):
+        exp2.run()
+    summ2 = json.loads((exp2.out_dir / "summary.json").read_text())
+    assert summ2["status"] == "stopped" and summ2["rounds_done"] == 1
+    assert not run_finished(exp2.out_dir / "summary.json")
+
+
+def test_results_tab_helpers(tmp_path):
+    pytest.importorskip("gradio")
+    from ssfl import gui
+    cfg = cfg_for(tmp_path, **{"strategy.name": "fedmatch"})
+    exp = Experiment(cfg, verbose=False)
+    exp.run()
+    runs = gui.scan_runs(str(tmp_path))
+    assert len(runs) == 1 and runs[0]["status"] == "finished" and runs[0]["time_s"] > 0
+    board = gui.leaderboard(runs)
+    assert {"time", "s/round", "started", "α"} <= set(board.columns)
+    html_out = gui.render_run_details(runs[0], exp.out_dir)
+    assert "FedMatch parameters" in html_out and "lambda_iccs" in html_out and "Environment" in html_out
+    acc, loss = gui.detail_frames(exp.out_dir)
+    assert len(acc) and len(loss)

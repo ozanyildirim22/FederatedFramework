@@ -110,9 +110,19 @@ from ssfl import Experiment
 history = Experiment.from_yaml("configs/cifar10_fedlabel.yaml", ["server.rounds=50"]).run()
 ```
 
-Every run writes `runs/<name>_<timestamp>/` with `config.yaml`, `metrics.csv`
-(per-round loss, mask rate, pseudo-label accuracy, test accuracy), `summary.json`
-and `global_model.pt`.
+Every run writes `runs/<name>_<timestamp>/` with:
+
+* `config.yaml`: **every** setting, including all algorithm and aggregator parameters
+  (defaults written out), so this file alone reproduces the run;
+* `metrics.csv`: per round loss, mask rate, pseudo-label accuracy, test accuracy and time;
+* `summary.json`: status (`running` / `finished` / `stopped` / `error`), start time, setup /
+  training / total time, seconds per round, best accuracy and its round, final metrics, DataLoader
+  workers, precision, and the environment (GPU, PyTorch, Python, code commit). It is updated after
+  every round, so stopped or interrupted runs keep their timing too;
+* `global_model.pt`: the final global model.
+
+The GUI's **🏆 Results → 🔍 Run details** shows all of this for one run, with its curves, download
+buttons and **Load these settings into Experiment**.
 
 ## Built-in algorithms
 
