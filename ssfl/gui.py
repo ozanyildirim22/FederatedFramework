@@ -892,6 +892,26 @@ def render_run_details(meta: Dict[str, Any], run_dir: Path) -> str:
     return f'<div class="details">{head}{kpis}<div class="dgrid">{body}</div>{note}</div>'
 
 
+def downloadable(run_dir: Path, names: Sequence[str]) -> List[Optional[str]]:
+    """Copies of a run's files in the temp folder, for the download buttons.
+
+    Gradio only serves files from the working directory or the temp folder. Runs on
+    Google Drive (/content/drive/...) are outside both, and returning their paths
+    failed the whole update ("Error" on every panel)."""
+    import shutil
+    dest = Path(tempfile.gettempdir()) / "ssfl_studio" / "run_files" / Path(run_dir).name
+    dest.mkdir(parents=True, exist_ok=True)
+    out: List[Optional[str]] = []
+    for n in names:
+        src = Path(run_dir) / n
+        if src.exists():
+            shutil.copy2(src, dest / n)
+            out.append(str(dest / n))
+        else:
+            out.append(None)
+    return out
+
+
 def detail_frames(run_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
     try:
         df = pd.read_csv(run_dir / "metrics.csv")
@@ -1875,11 +1895,14 @@ def build_app():
             if meta is None:
                 yield (_error_html(f"Cannot read {run_dir}"), *[gr.update()] * 5)
                 return
-            acc, loss = detail_frames(run_dir)
-            files = [str(run_dir / f) if (run_dir / f).exists() else None
-                     for f in ("config.yaml", "metrics.csv", "summary.json")]
-            yield (render_run_details(meta, run_dir), plot_update(acc, "series"), plot_update(loss, "series"),
-                   *files)
+            try:
+                acc, loss = detail_frames(run_dir)
+                files = downloadable(run_dir, ("config.yaml", "metrics.csv", "summary.json"))
+                page = render_run_details(meta, run_dir)
+            except Exception as e:  # noqa: BLE001 - show it in the panel, not as a failed update
+                yield (_error_html(f"Cannot show {run}: {e}", traceback.format_exc()), *[gr.update()] * 5)
+                return
+            yield (page, plot_update(acc, "series"), plot_update(loss, "series"), *files)
             # colour scales are fixed when a chart is first drawn: re-send them now the data is in
             time.sleep(0.4)
             yield (gr.update(), *[gr.update(color_map={**color_map(f, "series"), "​": "#000000"})
