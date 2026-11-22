@@ -18,12 +18,12 @@ class AugmentationFactory:
 
     def __init__(self, image_size: int, mean: Sequence[float], std: Sequence[float],
                  strong_aug: str = "randaugment", randaugment_n: int = 1, randaugment_m: int = 10,
-                 cutout: bool = False):
-        self.cutout = cutout
+                 cutout: bool = False, hflip: bool = True):
+        self.cutout, self.hflip = cutout, hflip
         self.image_size = image_size
         self.normalize = [T.ToTensor(), T.Normalize(mean, std)]
         pad = max(2, image_size // 8)
-        self._weak = [T.RandomHorizontalFlip(),
+        self._weak = ([T.RandomHorizontalFlip()] if hflip else []) + [
                       T.RandomCrop(image_size, padding=pad, padding_mode="reflect")]
         self._strong_extra = []
         if strong_aug == "randaugment":

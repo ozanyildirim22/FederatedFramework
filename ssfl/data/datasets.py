@@ -28,6 +28,10 @@ class RawDataset:
     num_classes: int
     mean: Tuple[float, ...]
     std: Tuple[float, ...]
+    #: False when a horizontal flip changes the meaning of an image, e.g. OrganAMNIST's
+    #: left / right organ classes (femur, kidney, lung): a flipped left kidney looks like a
+    #: right kidney but would keep the label "left". ``data.hflip`` overrides it.
+    hflip_safe: bool = True
 
     def __post_init__(self) -> None:
         if self.images.ndim == 3:                       # grayscale -> add channel dim
@@ -64,7 +68,7 @@ def load_cifar10(cfg) -> Tuple[RawDataset, RawDataset]:
     return out[0], out[1]
 
 
-def _load_medmnist(cls_name: str, cfg) -> Tuple[RawDataset, RawDataset]:
+def _load_medmnist(cls_name: str, cfg, hflip_safe: bool = True) -> Tuple[RawDataset, RawDataset]:
     import medmnist
 
     cls = getattr(medmnist, cls_name)
@@ -77,13 +81,14 @@ def _load_medmnist(cls_name: str, cfg) -> Tuple[RawDataset, RawDataset]:
     test = cls(split="test", **kwargs)
     num_classes = len(train.info["label"])
     mean, std = _channel_stats(train.imgs)
-    return (RawDataset(train.imgs, train.labels, num_classes, mean, std),
-            RawDataset(test.imgs, test.labels, num_classes, mean, std))
+    return (RawDataset(train.imgs, train.labels, num_classes, mean, std, hflip_safe),
+            RawDataset(test.imgs, test.labels, num_classes, mean, std, hflip_safe))
 
 
 @DATASETS.register("organamnist")
 def load_organamnist(cfg):
-    return _load_medmnist("OrganAMNIST", cfg)
+    # classes include femur / kidney / lung, each as left and right: no horizontal flips
+    return _load_medmnist("OrganAMNIST", cfg, hflip_safe=False)
 
 
 @DATASETS.register("pathmnist")

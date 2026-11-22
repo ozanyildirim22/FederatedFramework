@@ -152,7 +152,9 @@ every implementation choice the paper leaves open.
 All presets follow the ADD: Dirichlet α = 1.0 (the grid also runs 0.1), 1,000 rounds, evaluation every
 5 rounds, uniform random labeled/unlabeled split per client, weak view = flip + crop, strong view =
 weak + RandAugment (N = 1, M = 10). `data.cutout=true` adds Cutout, `data.split=stratified` keeps class
-proportions. Every evaluation reports Top-1 accuracy and macro-averaged precision, recall and F1
+proportions. Horizontal flips are **off for OrganAMNIST**: its classes include left and right
+femur, kidney and lung, and a flipped left kidney would keep the label "left" (`data.hflip=true|false`
+overrides; the run summary records what was used). Every evaluation reports Top-1 accuracy and macro-averaged precision, recall and F1
 (`test_precision`, `test_recall`, `test_f1`); the Results tab's thesis table also gives the relative
 ratio method / FedAvg (ADD Eq. 7).
 

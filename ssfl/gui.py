@@ -174,7 +174,7 @@ FIELDS = [
     "data.dataset", "data.root", "data.image_size", "data.partitioner", "data.alpha",
     "data.labeled_ratio", "data.batch_size", "data.unlabeled_batch_ratio", "data.num_workers",
     "data.strong_aug", "data.augment_device", "data.randaugment_n", "data.randaugment_m", "data.cutout",
-    "data.split",
+    "data.split", "data.hflip",
     "model.name", "model.norm", "model.params",
     "strategy.local_epochs", "strategy.local_steps", "strategy.optimizer",
     "strategy.lr", "strategy.momentum", "strategy.weight_decay", "strategy.prox_mu",
@@ -187,6 +187,10 @@ INT_FIELDS = {"seed", "data.image_size", "data.batch_size", "data.unlabeled_batc
               "data.num_workers", "data.randaugment_n", "data.randaugment_m",
               "strategy.local_epochs", "strategy.local_steps",
               "server.rounds", "server.num_clients", "server.eval_every"}
+
+
+#: data.hflip in the form: None = auto (the dataset decides; off for OrganAMNIST)
+HFLIP_CHOICES = {None: "auto", True: "on", False: "off"}
 
 
 def _get(d: Dict[str, Any], key: str):
@@ -213,6 +217,8 @@ def cfg_to_values(cfg: ExperimentConfig) -> List[Any]:
             v = v or 0
         elif key == "strategy.grad_clip":
             v = v or 0.0
+        elif key == "data.hflip":
+            v = HFLIP_CHOICES.get(v, "auto")
         vals.append(v)
     return vals
 
@@ -232,6 +238,8 @@ def values_to_cfg(*vals, algorithm: str = "fedlabel", params: Optional[Dict[str,
             v = None
         if key == "strategy.grad_clip" and not v:
             v = None
+        if key == "data.hflip":
+            v = {"on": True, "off": False}.get(v)
         _set(raw, key, v)
     raw["strategy"]["name"] = algorithm
     raw["strategy"]["params"] = copy.deepcopy(params or {})
@@ -893,6 +901,7 @@ def render_run_details(meta: Dict[str, Any], run_dir: Path) -> str:
                                                    f"M={data.get('randaugment_m', 10)}"
                                                    f"{', + Cutout' if data.get('cutout', 'randaugment_n' not in data) else ''})"),
                            ("labeled split", data.get("split", "stratified")),
+                           ("horizontal flip", {True: "on", False: "off"}.get(summ.get("hflip"), "on (not recorded)")),
                            ("augmentation on", data.get("augment_device", "cpu")),
                            ("DataLoader workers", summ.get("num_workers", data.get("num_workers")))])),
         ("🌐 Federation", _rows([("clients N", server.get("num_clients")), ("clients per round C", server.get("client_fraction")),
@@ -1430,6 +1439,9 @@ def build_app():
                                                      info="extra erasing on the strong view (not in the ADD)")
                                 split = gr.Dropdown(["random", "stratified"], value=v["data.split"],
                                                     label="Labeled split", info="random = ADD")
+                                hflip = gr.Dropdown(["auto", "on", "off"], value=v["data.hflip"],
+                                                    label="Horizontal flip",
+                                                    info="auto = off for OrganAMNIST (left/right organ classes)")
                         with gr.Accordion("🧠  Model & local training", open=False):
                             with gr.Row():
                                 model_name = gr.Dropdown(MODELS.names(), value=v["model.name"], label="Model")
@@ -1605,7 +1617,7 @@ def build_app():
         # ============================================================ wiring
         components = [name, seed, device, output_dir,
                       dataset, root, image_size, partitioner, alpha, labeled_ratio, batch_size,
-                      unl_ratio, num_workers, strong_aug, augment_device, ra_n, ra_m, cutout, split,
+                      unl_ratio, num_workers, strong_aug, augment_device, ra_n, ra_m, cutout, split, hflip,
                       model_name, norm, model_params,
                       local_epochs, local_steps, optimizer, lr, momentum, weight_decay,
                       prox_mu, grad_clip, precision, channels_last,

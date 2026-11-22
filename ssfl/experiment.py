@@ -144,6 +144,7 @@ class Experiment:
             "num_workers": self.num_workers,
             "precision": self.server.precision,
             "augment_device": self.cfg.data.augment_device,
+            "hflip": self.data.hflip,                 # resolved (auto = off for OrganAMNIST)
             "data_summary": self.data.summary(),
             "environment": self._env,
         }

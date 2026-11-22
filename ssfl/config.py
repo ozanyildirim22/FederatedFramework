@@ -27,6 +27,8 @@ class DataConfig:
     randaugment_n: int = 1              # RandAugment ops per image (ADD: N = 1)
     randaugment_m: int = 10             # RandAugment magnitude (ADD: 10)
     cutout: bool = False                # add Cutout (RandomErasing) to the strong view (not in the ADD)
+    hflip: Optional[bool] = None        # random horizontal flip in weak/strong views; None = auto
+                                        # (off for OrganAMNIST: left/right organ classes)
     split: str = "random"               # labeled/unlabeled split per client: random (ADD) | stratified
 
 

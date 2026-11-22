@@ -5,7 +5,7 @@ DataLoader workers. With a fast GPU that becomes the bottleneck. Here the whole
 dataset lives on the training device as one ``uint8`` tensor (OrganAMNIST
 27 MB, CIFAR-10 150 MB) and every batch is augmented with batched tensor ops:
 
-* **weak**   - random horizontal flip + random crop with reflect padding
+* **weak**   - random horizontal flip (unless ``data.hflip`` / the dataset says no) + random crop with reflect padding
                (``max(2, size // 8)`` pixels), as ``AugmentationFactory.weak``;
 * **strong** - weak + RandAugment (+ Cutout if ``data.cutout``), as ``AugmentationFactory.strong``.
   RandAugment uses torchvision's own op table and ``_apply_op`` (same operations
@@ -39,8 +39,8 @@ def _reflect(idx: torch.Tensor, size: int) -> torch.Tensor:
 class GPUAugment:
     def __init__(self, image_size: int, mean: Sequence[float], std: Sequence[float],
                  strong_aug: str = "randaugment", randaugment_n: int = 1, randaugment_m: int = 10,
-                 device: torch.device = torch.device("cpu"), cutout: bool = False):
-        self.use_cutout = cutout
+                 device: torch.device = torch.device("cpu"), cutout: bool = False, hflip: bool = True):
+        self.use_cutout, self.hflip = cutout, hflip
         if strong_aug not in ("randaugment", "none"):
             raise ValueError(f"Unknown strong_aug '{strong_aug}'")
         self.size, self.pad = image_size, max(2, image_size // 8)
@@ -59,8 +59,9 @@ class GPUAugment:
     def weak(self, x: torch.Tensor) -> torch.Tensor:
         """uint8 (B, C, H, W) -> uint8, random flip + reflect-padded random crop per sample."""
         b, _, h, w = x.shape
-        flip = torch.rand(b, device=x.device) < 0.5
-        x = torch.where(flip.view(-1, 1, 1, 1), x.flip(-1), x)
+        if self.hflip:
+            flip = torch.rand(b, device=x.device) < 0.5
+            x = torch.where(flip.view(-1, 1, 1, 1), x.flip(-1), x)
         p = self.pad
         oy = torch.randint(0, 2 * p + 1, (b,), device=x.device) - p
         ox = torch.randint(0, 2 * p + 1, (b,), device=x.device) - p

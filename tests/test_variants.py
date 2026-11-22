@@ -472,3 +472,53 @@ def test_paper_baseline_labels():
     assert gui._variant("fixmatch", {"prox_mu": 0.01}, "prox") == "FedProx+FixMatch"
     assert gui._variant("uda", {"prox_mu": 0}, None) == "FedAvg+UDA"
     assert gui._variant("fedlabel", {}, "tau_5") == "FedLabel (tau_5)"
+
+
+# ------------------------------------------------------------- horizontal flips
+def test_no_hflip_when_dataset_is_not_flip_safe(tmp_path, monkeypatch):
+    import numpy as np
+    from ssfl import DATASETS
+    from ssfl.config import DataConfig
+    from ssfl.data import DataManager
+    from ssfl.data.datasets import RawDataset
+    from ssfl.data.gpu import GPUAugment
+
+    def unsafe(cfg):                                   # like OrganAMNIST (left/right classes)
+        rng = np.random.default_rng(0)
+        x = rng.integers(0, 255, (200, 8, 8, 1)).astype(np.uint8)
+        y = rng.integers(0, 4, 200)
+        return RawDataset(x, y, 4, (0.5,), (0.25,), False), RawDataset(x[:40], y[:40], 4, (0.5,), (0.25,), False)
+    monkeypatch.setitem(DATASETS._items, "test_unsafe", unsafe)
+    dm = DataManager(DataConfig(dataset="test_unsafe", num_workers=0), 2, seed=0)
+    assert dm.hflip is False
+    assert "RandomHorizontalFlip" not in [type(t).__name__ for t in dm.aug.weak().transforms]
+    assert "RandomHorizontalFlip" not in [type(t).__name__ for t in dm.aug.strong().transforms]
+    forced = DataManager(DataConfig(dataset="test_unsafe", num_workers=0, hflip=True), 2, seed=0)
+    assert forced.hflip is True                         # explicit setting wins
+    syn = DataManager(DataConfig(dataset="synthetic", num_workers=0), 2, seed=0)
+    assert syn.hflip is True                            # flip-safe datasets keep the flip
+    # GPU pipeline: with hflip off, a left/right-asymmetric image is never mirrored
+    aug = GPUAugment(8, (0.5,), (0.25,), hflip=False)
+    img = torch.zeros(64, 1, 8, 8, dtype=torch.uint8)
+    img[:, :, :, :4] = 255                              # bright left half
+    out = aug.weak(img).float()
+    assert (out[:, :, :, :2].mean() > out[:, :, :, -2:].mean())   # still brighter on the left
+
+
+def test_organamnist_loader_marks_flip_unsafe(monkeypatch):
+    import sys
+    import types
+    import numpy as np
+    from ssfl.config import DataConfig
+    from ssfl.data.datasets import load_organamnist, load_pathmnist
+
+    class Fake:
+        info = {"label": {str(i): str(i) for i in range(3)}}
+
+        def __init__(self, split, **kw):
+            self.imgs = np.zeros((6, 4, 4), np.uint8)
+            self.labels = np.zeros((6, 1), np.int64)
+    monkeypatch.setitem(sys.modules, "medmnist", types.SimpleNamespace(OrganAMNIST=Fake, PathMNIST=Fake))
+    cfg = DataConfig(root=str(__import__("tempfile").gettempdir()))
+    assert load_organamnist(cfg)[0].hflip_safe is False
+    assert load_pathmnist(cfg)[0].hflip_safe is True

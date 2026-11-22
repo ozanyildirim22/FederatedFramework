@@ -112,9 +112,11 @@ class DataManager:
         self.train, self.test = raw if raw is not None else DATASETS.get(cfg.dataset)(cfg)
         self.num_classes = self.train.num_classes
         self.in_channels = self.train.in_channels
+        hflip = getattr(cfg, "hflip", None)
+        self.hflip = self.train.hflip_safe if hflip is None else bool(hflip)   # None = dataset decides
         self.aug = AugmentationFactory(self.train.image_size, self.train.mean, self.train.std,
                                        cfg.strong_aug, cfg.randaugment_n, cfg.randaugment_m,
-                                       cutout=getattr(cfg, "cutout", False))
+                                       cutout=getattr(cfg, "cutout", False), hflip=self.hflip)
 
         self.partitions: List[np.ndarray] = PARTITIONERS.get(cfg.partitioner)(
             self.train.labels, num_clients, self.rng, alpha=cfg.alpha,
@@ -143,7 +145,7 @@ class DataManager:
             from .gpu import DeviceDataset, GPUAugment
             aug = GPUAugment(self.train.image_size, self.train.mean, self.train.std, self.cfg.strong_aug,
                              self.cfg.randaugment_n, self.cfg.randaugment_m, device=self.device,
-                             cutout=getattr(self.cfg, "cutout", False))
+                             cutout=getattr(self.cfg, "cutout", False), hflip=self.hflip)
             self._gpu = (DeviceDataset(self.train, self.device), DeviceDataset(self.test, self.device), aug)
         return self._gpu
 
