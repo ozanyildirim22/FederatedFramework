@@ -42,7 +42,7 @@ Implementation choices (not fixed by the paper)
 -----------------------------------------------
 * ``global_layers``: state-dict key prefixes taken from ``G``. Defaults: the
   first two conv blocks of ``simple_cnn`` (as in the paper's CNN), and the stem
-  plus the first residual stage of ``resnet18``. Other models use the first
+  plus the first residual stage of ``resnet18`` / ``resnet34``. Other models use the first
   ``global_fraction`` of parameter tensors.
 * A client seen for the first time has no ``l^k`` yet; ``G`` is used instead.
 * ``finetune_steps`` is capped at half of the round's local steps, so short
@@ -87,6 +87,7 @@ class _WeakOnly(Dataset):
 DEFAULT_GLOBAL_LAYERS = {
     "SimpleCNN": ["features.0.", "features.1."],
     "ResNet18": ["stem.", "layers.0.", "layers.1."],
+    "ResNet34": ["stem.", "layers.0.", "layers.1.", "layers.2."],
 }
 
 

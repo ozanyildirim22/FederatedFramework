@@ -62,18 +62,21 @@ class BasicBlock(nn.Module):
         return F.relu(out + self.shortcut(x))
 
 
-@MODELS.register("resnet18")
-class ResNet18(nn.Module):
-    """CIFAR-style ResNet-18 (3x3 stem, no max-pool) - works for 28px and 32px inputs."""
+class _CifarResNet(nn.Module):
+    """CIFAR-style ResNet (3x3 stem, no max-pool) built from BasicBlocks -
+    works for 28px and 32px inputs. ``blocks`` is the number of blocks per stage."""
+
+    blocks = (2, 2, 2, 2)
 
     def __init__(self, num_classes: int, in_channels: int = 3, norm: str = "gn", width: int = 64):
         super().__init__()
         self.stem = nn.Sequential(nn.Conv2d(in_channels, width, 3, 1, 1, bias=False),
                                   make_norm(norm, width), nn.ReLU(inplace=True))
         layers, cin = [], width
-        for i, (mult, stride) in enumerate([(1, 1), (2, 2), (4, 2), (8, 2)]):
+        for n_blocks, (mult, stride) in zip(self.blocks, [(1, 1), (2, 2), (4, 2), (8, 2)]):
             cout = width * mult
-            layers += [BasicBlock(cin, cout, stride, norm), BasicBlock(cout, cout, 1, norm)]
+            layers.append(BasicBlock(cin, cout, stride, norm))
+            layers += [BasicBlock(cout, cout, 1, norm) for _ in range(n_blocks - 1)]
             cin = cout
         self.layers = nn.Sequential(*layers)
         self.pool = nn.AdaptiveAvgPool2d(1)
@@ -87,6 +90,20 @@ class ResNet18(nn.Module):
     def forward(self, x):
         x = self.pool(self.layers(self.stem(x))).flatten(1)
         return self.fc(x)
+
+
+@MODELS.register("resnet18")
+class ResNet18(_CifarResNet):
+    """CIFAR-style ResNet-18: 2-2-2-2 blocks (FedLabel's MedMNIST model)."""
+
+    blocks = (2, 2, 2, 2)
+
+
+@MODELS.register("resnet34")
+class ResNet34(_CifarResNet):
+    """CIFAR-style ResNet-34: 3-4-6-3 blocks (FedLabel's CIFAR-10 model)."""
+
+    blocks = (3, 4, 6, 3)
 
 
 def build_model(cfg, num_classes: int, in_channels: int) -> nn.Module:

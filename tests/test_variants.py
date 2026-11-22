@@ -81,11 +81,20 @@ def test_batchnorm_models(tmp_path, strategy):
     run(cfg_for(tmp_path, **{"strategy.name": strategy, "strategy.params": params, "model.norm": "bn"}))
 
 
-@pytest.mark.parametrize("strategy", ["fedmatch", "fedtrinet"])
-def test_resnet18(tmp_path, strategy):
+@pytest.mark.parametrize("model", ["resnet18", "resnet34"])
+@pytest.mark.parametrize("strategy", ["fedmatch", "fedtrinet", "fedlabel"])
+def test_resnets(tmp_path, strategy, model):
     params = {"pretrain_rounds": 1} if strategy == "fedtrinet" else {}
-    run(cfg_for(tmp_path, **{"strategy.name": strategy, "strategy.params": params, "model.name": "resnet18",
+    run(cfg_for(tmp_path, **{"strategy.name": strategy, "strategy.params": params, "model.name": model,
                              "model.params": {"width": 8}, "server.rounds": 2}))
+
+
+def test_resnet_depths():
+    from types import SimpleNamespace
+    from ssfl.models import build_model
+    for name, n_blocks in [("resnet18", 8), ("resnet34", 16)]:
+        m = build_model(SimpleNamespace(name=name, norm="gn", params={}), num_classes=10, in_channels=3)
+        assert len(m.layers) == n_blocks
 
 
 def test_fedprox_mu_and_config_prox():

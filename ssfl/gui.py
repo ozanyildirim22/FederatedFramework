@@ -73,7 +73,7 @@ PRESET_INFO = {
     "quick_test.yaml": ("⚡", "Quick demo", "Synthetic data · runs in seconds"),
     "organamnist_fedlabel.yaml": ("🫁", "OrganAMNIST", "Cross-silo · 10 hospitals · 100 rounds"),
     "pathmnist_fedlabel.yaml": ("🔬", "PathMNIST", "Cross-silo · 10 hospitals · 100 rounds"),
-    "cifar10_fedlabel.yaml": ("🖼️", "CIFAR-10", "Cross-device · 100 clients · 200 rounds"),
+    "cifar10_fedlabel.yaml": ("🖼️", "CIFAR-10", "Cross-device · 100 clients · ResNet-34"),
 }
 
 #: parameter -> (help text, choices or None)

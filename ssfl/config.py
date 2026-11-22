@@ -30,7 +30,7 @@ class DataConfig:
 
 @dataclass
 class ModelConfig:
-    name: str = "resnet18"              # simple_cnn | resnet18 | <registered>
+    name: str = "resnet18"              # simple_cnn | resnet18 | resnet34 | <registered>
     norm: str = "gn"                    # bn | gn (GroupNorm is more robust to non-IID data)
     params: Dict[str, Any] = field(default_factory=dict)
 

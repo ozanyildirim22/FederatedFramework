@@ -25,7 +25,7 @@ ssfl/
 ├── server/              # ── Tier 3: Server-Side Aggregation Module
 │   ├── server.py        #   client selection (fraction C), broadcast, aggregation, evaluation
 │   └── aggregators.py   #   fedavg, fedavgm, fedadam, fedmedian
-├── models.py            # simple_cnn, resnet18 (BatchNorm or GroupNorm)
+├── models.py            # simple_cnn, resnet18, resnet34 (BatchNorm or GroupNorm)
 ├── experiment.py        # wires everything + logging (metrics.csv, summary.json, model)
 └── grid.py              # runs a whole grid of experiments from one YAML (resumable)
 ```
@@ -142,9 +142,9 @@ every implementation choice the paper leaves open.
 
 | Dataset (`data.dataset`) | Classes | Train / test | Setting in the presets |
 |---|---|---|---|
-| `cifar10` | 10 | 50,000 / 10,000 (32×32 RGB) | cross-device: 100 clients, C = 0.1, 200 rounds, 20% / 50% labels |
-| `organamnist` | 11 | 34,561 / 17,778 (28×28 gray) | cross-silo: 10 clients, C = 1.0, 100 rounds, 5% / 20% labels |
-| `pathmnist` | 9 | 89,996 / 7,180 (28×28 RGB, val split unused) | cross-silo: 10 clients, C = 1.0, 100 rounds, 5% / 20% labels |
+| `cifar10` | 10 | 50,000 / 10,000 (32×32 RGB) | cross-device: 100 clients, C = 0.1, 200 rounds, 20% / 50% labels, **ResNet-34** |
+| `organamnist` | 11 | 34,561 / 17,778 (28×28 gray) | cross-silo: 10 clients, C = 1.0, 100 rounds, 5% / 20% labels, ResNet-18 |
+| `pathmnist` | 9 | 89,996 / 7,180 (28×28 RGB, val split unused) | cross-silo: 10 clients, C = 1.0, 100 rounds, 5% / 20% labels, ResNet-18 |
 
 All three download automatically into `data.root` the first time they are used.
 
