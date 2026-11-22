@@ -9,7 +9,7 @@ Grid file layout::
     common: {server.eval_every: 5}          # overrides for every run (optional)
     algorithms:                             # name -> strategy.params (replaces the preset's params)
       fedavg: {}
-      fedlabel: {beta: 0.95, lambda0: 1.0}
+      fedlabel: {beta: 0.5, lambda0: 1.0}
     experiments:
       - config: configs/organamnist_fedlabel.yaml
         labeled_ratio: [0.05, 0.2]
@@ -17,8 +17,13 @@ Grid file layout::
         overrides: {server.rounds: 100}     # optional, for this experiment only
         algorithm_params: {fedtrinet: {pretrain_rounds: 20}}   # optional, merged into the params
         algorithms: [fedavg, fedlabel]      # optional subset (default: all)
+        seeds: [0, 1, 2]                    # optional, per experiment (overrides the top-level list)
+    seeds: [0]                              # optional: repeat every run with these seeds
 
-Every run is named ``<dataset>_<algorithm>_l<ratio>_a<alpha>[_<tag>]``. A run whose name
+Every run is named ``<dataset>_<algorithm>_l<ratio>_a<alpha>[_<tag>][_s<seed>]``; the
+``_s<seed>`` suffix is left out for the preset's own seed, so adding seeds to a grid keeps
+the runs already done. The FedLabel paper averages 3 seeds (appendix A); the Results tab
+shows the mean and standard deviation over seeds. A run whose name
 already has a ``summary.json`` in ``output_dir`` is skipped, so an interrupted
 grid (for example a Colab session that timed out) continues where it stopped.
 Use ``--no-resume`` to run everything again.
@@ -56,7 +61,8 @@ def expand_grid(path: str | Path, extra: Optional[Sequence[str]] = None
     spec = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     algorithms: Dict[str, Dict[str, Any]] = spec.get("algorithms") or {}
     common: Dict[str, Any] = spec.get("common") or {}
-    runs: List[Tuple[str, ExperimentConfig]] = []
+    top_seeds = spec.get("seeds")
+    runs: List[Tuple[int, str, ExperimentConfig]] = []
     for exp in spec.get("experiments") or []:
         raw = yaml.safe_load(_resolve(exp["config"], path).read_text(encoding="utf-8")) or {}
         raw = apply_overrides(raw, common)
@@ -66,7 +72,11 @@ def expand_grid(path: str | Path, extra: Optional[Sequence[str]] = None
         alphas = exp.get("alpha") or [raw.get("data", {}).get("alpha", 0.5)]
         alphas = alphas if isinstance(alphas, list) else [alphas]
         names = exp.get("algorithms") or list(algorithms)
-        for ratio, alpha, algo in ((r_, a_, n_) for r_ in ratios for a_ in alphas for n_ in names):
+        base_seed = int(raw.get("seed", ExperimentConfig().seed))
+        seeds = exp.get("seeds", top_seeds)
+        seeds = [base_seed] if seeds is None else (seeds if isinstance(seeds, list) else [seeds])
+        for ratio, alpha, algo, seed in ((r_, a_, n_, s_) for r_ in ratios for a_ in alphas
+                                         for n_ in names for s_ in seeds):
             if algo not in algorithms:
                 raise KeyError(f"Algorithm '{algo}' is not defined under 'algorithms'")
             params = copy.deepcopy(algorithms[algo] or {})
@@ -81,10 +91,15 @@ def expand_grid(path: str | Path, extra: Optional[Sequence[str]] = None
             name = f"{dataset}_{algo}_l{_ratio_tag(ratio)}_a{_ratio_tag(alpha)}"
             if exp.get("tag"):
                 name += f"_{exp['tag']}"
+            r["seed"] = int(seed)
+            if int(seed) != base_seed:
+                name += f"_s{int(seed)}"
             r["name"] = name
             r = apply_overrides(r, list(extra or []))
-            runs.append((name, ExperimentConfig.from_dict(r)))
-    return runs
+            runs.append((seeds.index(seed), name, ExperimentConfig.from_dict(r)))
+    # the whole grid with the first seed, then again with the second, ...: an interrupted
+    # grid has complete tables for the seeds it finished
+    return [(n, c) for _, n, c in sorted(runs, key=lambda t: t[0])]
 
 
 def run_finished(summary_path: Path) -> bool:

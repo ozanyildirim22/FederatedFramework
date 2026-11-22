@@ -18,7 +18,7 @@ strategy:
   local_epochs: 1
   lr: 0.03
   params:                     # FedLabel as in the ADD (Section 3.1, Algorithm 2)
-    beta: 0.95                # pseudo-label confidence threshold (beta)
+    beta: 0.5                 # pseudo-label confidence threshold (paper appendix A: 0.3-0.5 best)
     lambda0: 1.0              # scale of the global-local consistency weight (lambda_0)
     lambda_u: 1.0             # weight of the pseudo-label cross-entropy
     sup_epochs: 1             # tau: epochs on labeled data (Step 1)

@@ -30,6 +30,10 @@ class DataConfig:
     hflip: Optional[bool] = None        # random horizontal flip in weak/strong views; None = auto
                                         # (off for OrganAMNIST: left/right organ classes)
     split: str = "random"               # labeled/unlabeled split per client: random (ADD) | stratified
+    holdout: str = "official"           # official: the dataset's train/test (ADD) | resplit: pool all splits
+                                        # and re-divide (FedLabel paper: 80/5/15 with val 0.05, test 0.15)
+    val_ratio: float = 0.0              # validation share (official: of the training set); 0 = none
+    test_ratio: float = 0.15            # test share of the pooled data (resplit only)
 
 
 @dataclass

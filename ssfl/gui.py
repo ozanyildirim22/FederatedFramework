@@ -84,7 +84,7 @@ PRESET_INFO = {
 PARAM_HELP: Dict[str, Tuple[str, Optional[List[str]]]] = {
     "tau": ("Confidence threshold to keep a pseudo-label", None),
     "lambda_u": ("Weight of the unlabeled (pseudo-label) loss", None),
-    "beta": ("β: confidence threshold to keep a pseudo-label", None),
+    "beta": ("β: confidence threshold to keep a pseudo-label (paper appendix: 0.3–0.5 best)", None),
     "sup_steps": ("τ: SGD steps on labeled data (Step 1); empty = use sup_epochs", None),
     "unsup_steps": ("τ′: SGD steps on unlabeled data (Steps 2–3); empty = use unsup_epochs", None),
     "weight_by_used": ("Aggregation weight r_k = samples used this round (paper's Alg. 1)", None),
@@ -174,7 +174,7 @@ FIELDS = [
     "data.dataset", "data.root", "data.image_size", "data.partitioner", "data.alpha",
     "data.labeled_ratio", "data.batch_size", "data.unlabeled_batch_ratio", "data.num_workers",
     "data.strong_aug", "data.augment_device", "data.randaugment_n", "data.randaugment_m", "data.cutout",
-    "data.split", "data.hflip",
+    "data.split", "data.hflip", "data.holdout", "data.val_ratio", "data.test_ratio",
     "model.name", "model.norm", "model.params",
     "strategy.local_epochs", "strategy.local_steps", "strategy.optimizer",
     "strategy.lr", "strategy.momentum", "strategy.weight_decay", "strategy.prox_mu",
@@ -737,10 +737,12 @@ def _run_meta(run_dir: Path) -> Dict[str, Any]:
     cfg = _read_yaml(run_dir / "config.yaml")
     summ = _read_json(run_dir / "summary.json")
     base = re.sub(RUN_STAMP, "", run_dir.name)
-    m = re.search(r"_l[0-9p]+(?:_a[0-9p]+)?_(.+)$", base)
+    seed = cfg.get("seed", 0)
+    group = re.sub(rf"_s{seed}$", "", base) if seed is not None else base   # grid seed repeats
+    m = re.search(r"_l[0-9p]+(?:_a[0-9p]+)?(?:_(.+))?$", group)   # tag after labels / alpha
     algo = cfg.get("strategy", {}).get("name", "?")
     data, server, strat = cfg.get("data", {}), cfg.get("server", {}), cfg.get("strategy", {})
-    return {"run": run_dir.name, "base": base, "dataset": data.get("dataset", "?"),
+    return {"run": run_dir.name, "base": base, "group": group, "seed": seed, "dataset": data.get("dataset", "?"),
             "labels": data.get("labeled_ratio"), "alpha": data.get("alpha"),
             "clients": server.get("num_clients"), "fraction": server.get("client_fraction"),
             "algorithm": algo, "variant": _variant(algo, strat, m.group(1) if m else None),
@@ -792,6 +794,14 @@ def load_run(run_dir: Path) -> Optional[Dict[str, Any]]:
     meta["final_acc"] = float(acc.iloc[-1]) if len(acc) else None
     f1 = df["test_f1"].dropna() if "test_f1" in df else pd.Series(dtype=float)
     meta["best_f1"] = float(f1.max()) if len(f1) else None
+    # model selection on the validation set: test accuracy at the best validation round
+    meta["best_val"], meta["test_at_val"] = None, None
+    if "val_acc" in df and df["val_acc"].notna().any():
+        i = df["val_acc"].idxmax()
+        meta["best_val"] = float(df.loc[i, "val_acc"])
+        meta["test_at_val"] = float(df.loc[i, "test_acc"]) if "test_acc" in df and df.loc[i, "test_acc"] == df.loc[i, "test_acc"] else None
+    cs = df["client_s"].dropna() if "client_s" in df else pd.Series(dtype=float)
+    meta["client_s"] = float(cs.mean()) if len(cs) else None
     last = df.iloc[-1] if len(df) else {}
     meta["mask"] = float(last["train_mask_rate"]) if "train_mask_rate" in df and last["train_mask_rate"] == last["train_mask_rate"] else None
     meta["pl_acc"] = float(df["train_pl_acc"].dropna().iloc[-1]) if "train_pl_acc" in df and df["train_pl_acc"].notna().any() else None
@@ -901,13 +911,25 @@ def render_run_details(meta: Dict[str, Any], run_dir: Path) -> str:
                                                    f"M={data.get('randaugment_m', 10)}"
                                                    f"{', + Cutout' if data.get('cutout', 'randaugment_n' not in data) else ''})"),
                            ("labeled split", data.get("split", "stratified")),
+                           ("train / val / test", "re-split " + f"{100 * (1 - data.get('val_ratio', 0) - data.get('test_ratio', 0.15)):g}"
+                            f" / {100 * data.get('val_ratio', 0):g} / {100 * data.get('test_ratio', 0.15):g}%"
+                            if data.get("holdout") == "resplit" else
+                            "official split" + (f", {100 * data['val_ratio']:g}% of train held out for validation"
+                                                if data.get("val_ratio") else "")),
                            ("horizontal flip", {True: "on", False: "off"}.get(summ.get("hflip"), "on (not recorded)")),
                            ("augmentation on", data.get("augment_device", "cpu")),
                            ("DataLoader workers", summ.get("num_workers", data.get("num_workers")))])),
         ("🌐 Federation", _rows([("clients N", server.get("num_clients")), ("clients per round C", server.get("client_fraction")),
                                  ("rounds", f"{meta['rounds']} / {server.get('rounds')}"),
                                  ("aggregator", server.get("aggregator")), ("evaluate every", server.get("eval_every")),
-                                 ("seed", cfg.get("seed"))])),
+                                 ("seed", cfg.get("seed")),
+                                 ("local training / client / round", f"{summ['mean_client_s']:.2f} s"
+                                  if summ.get("mean_client_s") is not None else "not recorded"),
+                                 ("server work / round", f"{summ['mean_server_s']:.2f} s"
+                                  if summ.get("mean_server_s") is not None else "not recorded")]
+                                + ([("best validation acc", f"{_pct(summ['best_val_acc'])}% at round {summ.get('best_val_round')}"),
+                                    ("test acc at best validation", f"{_pct(summ.get('test_acc_at_best_val'))}%")]
+                                   if summ.get("best_val_acc") is not None else []))),
         ("🧠 Local training", _rows([("model", model.get("name")), ("normalisation", model.get("norm")),
                                      ("optimizer", strat.get("optimizer")), ("learning rate", strat.get("lr")),
                                      ("momentum", strat.get("momentum")), ("weight decay", strat.get("weight_decay")),
@@ -977,16 +999,23 @@ def detail_frames(run_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
 
 THESIS_VALUES = {"acc": "Best test accuracy (%)", "f1": "Best macro F1 (%)",
+                 "val": "Test accuracy at the best validation round (%)",
                  "ratio": "Relative accuracy ratio (method / FedAvg, same setting)"}
+THESIS_COLUMN = {"acc": "best_acc", "f1": "best_f1", "val": "test_at_val", "ratio": "best_acc"}
 
 
 def thesis_table(runs: List[Dict[str, Any]], value: str = "acc") -> pd.DataFrame:
     """Rows = algorithm (variant), columns = dataset · labels · α.
 
-    ``value``: ``acc`` best test accuracy (%), ``f1`` best macro F1 (%), ``ratio`` best
-    accuracy divided by FedAvg's best accuracy in the same column (the ADD's Eq. 7; FedAvg
+    ``value``: ``acc`` best test accuracy (%), ``f1`` best macro F1 (%), ``val`` test accuracy
+    at the round with the best validation accuracy (runs with ``data.val_ratio > 0``), ``ratio``
+    best accuracy divided by FedAvg's best accuracy in the same column (the ADD's Eq. 7; FedAvg
     trained on the same labeled data, i.e. the low baseline). Only finished runs count; for
-    repeated runs of the same name the most recent one is used."""
+    repeated runs of the same name the most recent one is used.
+
+    Runs that differ only in the seed (grid ``seeds``) are averaged, as in the FedLabel paper:
+    the table holds the mean; ``table.attrs["std"]`` / ``table.attrs["n"]`` hold the standard
+    deviation and the number of seeds per cell (see :func:`thesis_display`)."""
     rows = [r for r in runs if r["best_acc"] is not None and r["finished"]]
     if not rows:
         return pd.DataFrame()
@@ -1003,22 +1032,53 @@ def thesis_table(runs: List[Dict[str, Any]], value: str = "acc") -> pd.DataFrame
             out += f" α{r['alpha']:g}"
         return out
 
-    df["setting"] = df.apply(setting, axis=1)
-    col = "best_f1" if value == "f1" else "best_acc"
-    if col not in df:
+    col = THESIS_COLUMN.get(value, "best_acc")
+    if col not in df or df[col].isna().all():
         return pd.DataFrame()
-    piv = df.pivot_table(index="variant", columns="setting", values=col, aggfunc="max")
+    df["setting"] = df.apply(setting, axis=1)
+    df["seed"] = df["seed"].fillna(0) if "seed" in df else 0
+    # one value per seed (same-seed duplicates, e.g. a GUI and a grid run: the best), then over seeds
+    per_seed = df.dropna(subset=[col]).groupby(["variant", "setting", "seed"])[col].max()
+    cells = per_seed.groupby(["variant", "setting"])
+    piv = cells.mean().unstack("setting")
+    std = cells.std(ddof=0).unstack("setting").reindex_like(piv)
+    n = cells.count().unstack("setting").reindex_like(piv)
     if value == "ratio":
         base = piv.loc["FedAvg"] if "FedAvg" in piv.index else None
         piv = piv / base if base is not None else piv * float("nan")
+        std = std * float("nan")
     else:
-        piv = piv * 100
+        piv, std = piv * 100, std * 100
     order = [algo_label(a) for a in ALGO_ORDER]
-    piv = piv.reindex(sorted(piv.index, key=lambda v: (order.index(v.split(" (")[0])
-                                                       if v.split(" (")[0] in order else 99, v)))
-    piv = piv.round(3 if value == "ratio" else 2).reset_index().rename(columns={"variant": "algorithm"})
-    piv.columns.name = None
-    return piv
+    idx = sorted(piv.index, key=lambda v: (order.index(v.split(" (")[0]) if v.split(" (")[0] in order else 99, v))
+    digits = 3 if value == "ratio" else 2
+
+    def tidy(t):
+        t = t.reindex(idx).round(digits).reset_index().rename(columns={"variant": "algorithm"})
+        t.columns.name = None
+        return t
+
+    out = tidy(piv)
+    out.attrs["std"], out.attrs["n"] = tidy(std), tidy(n)
+    return out
+
+
+def thesis_display(table: pd.DataFrame) -> pd.DataFrame:
+    """The thesis table as text: ``mean ± std`` where a cell averages several seeds."""
+    if table is None or not len(table) or "std" not in table.attrs:
+        return table
+    std, n = table.attrs["std"], table.attrs["n"]
+    out = table.copy().astype(object)
+    for c in table.columns[1:]:
+        for i in range(len(table)):
+            v = table.at[i, c]
+            if v != v:
+                out.at[i, c] = ""
+            elif n.at[i, c] == n.at[i, c] and n.at[i, c] > 1 and std.at[i, c] == std.at[i, c]:
+                out.at[i, c] = f"{v:g} ± {std.at[i, c]:.2f}"
+            else:
+                out.at[i, c] = f"{v:g}"
+    return out
 
 
 def _tex(text: str) -> str:
@@ -1039,6 +1099,7 @@ def to_latex(table: pd.DataFrame, caption: str = "Best test accuracy (%)", digit
              f"\\caption{{{_tex(caption)}}}",
              r"\begin{tabular}{l" + "c" * (len(cols) - 1) + "}", r"\toprule",
              " & ".join(_tex(c) for c in cols) + r" \\", r"\midrule"]
+    std, n = table.attrs.get("std"), table.attrs.get("n")
     for i, row in table.iterrows():
         cells = [_tex(row[cols[0]])]
         for c in cols[1:]:
@@ -1047,7 +1108,10 @@ def to_latex(table: pd.DataFrame, caption: str = "Best test accuracy (%)", digit
                 cells.append("--")
             else:
                 s = f"{v:.{digits}f}"
-                cells.append(f"\\textbf{{{s}}}" if v == best[c] else s)
+                s = f"\\textbf{{{s}}}" if v == best[c] else s
+                if std is not None and n.at[i, c] > 1 and std.at[i, c] == std.at[i, c]:
+                    s += f" {{\\scriptsize$\\pm${std.at[i, c]:.2f}}}"     # mean (± std) over seeds
+                cells.append(s)
         lines.append(" & ".join(cells) + r" \\")
     lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
     return "\n".join(lines) + "\n"
@@ -1369,7 +1433,7 @@ def build_app():
                             labeled_ratio = gr.Slider(0.01, 1.0, value=v["data.labeled_ratio"], step=0.01,
                                                       label="Labeled data per client",
                                                       info="Thesis: 20% / 50% (CIFAR-10), 5% / 20% (MedMNIST)")
-                            rounds = gr.Slider(1, 500, value=v["server.rounds"], step=1,
+                            rounds = gr.Slider(1, 2000, value=v["server.rounds"], step=1,   # presets: 1,000 (ADD)
                                                label="Communication rounds")
                             alpha = gr.Slider(0.01, 10, value=v["data.alpha"], step=0.01,
                                               label="Non-IID level — Dirichlet α",
@@ -1442,6 +1506,15 @@ def build_app():
                                 hflip = gr.Dropdown(["auto", "on", "off"], value=v["data.hflip"],
                                                     label="Horizontal flip",
                                                     info="auto = off for OrganAMNIST (left/right organ classes)")
+                            with gr.Row():
+                                holdout = gr.Dropdown(["official", "resplit"], value=v["data.holdout"],
+                                                      label="Test set",
+                                                      info="official = dataset's test split (ADD) · resplit = "
+                                                           "pool all and re-divide (paper 80/5/15)")
+                                val_ratio = gr.Number(v["data.val_ratio"], label="Validation share",
+                                                      info="0 = none · paper 0.05 · official: share of train")
+                                test_ratio = gr.Number(v["data.test_ratio"], label="Test share (resplit)",
+                                                       info="paper 0.15")
                         with gr.Accordion("🧠  Model & local training", open=False):
                             with gr.Row():
                                 model_name = gr.Dropdown(MODELS.names(), value=v["model.name"], label="Model")
@@ -1599,9 +1672,12 @@ def build_app():
                                                  y="value", color="run", height=380)
                     with gr.Tab("🎓  Thesis table", id="thesis"):
                         gr.Markdown("One row per algorithm, one column per dataset · labels · α, from finished "
-                                    "runs (latest run of each name). The ratio divides by FedAvg's best "
-                                    "accuracy in the same column (ADD Eq. 7). Bold in LaTeX = best in "
-                                    "column; the table uses the `booktabs` package.")
+                                    "runs (latest run of each name). Runs repeated with other seeds "
+                                    "(grid `seeds`) are averaged: **mean ± std**, as in the FedLabel paper. "
+                                    "The ratio divides by FedAvg's best accuracy in the same column (ADD "
+                                    "Eq. 7). *Test acc. at best validation* needs runs with a validation "
+                                    "set (`data.val_ratio`). Bold in LaTeX = best in column; the table "
+                                    "uses the `booktabs` package.")
                         thesis_value = gr.Radio([(lab, k) for k, lab in THESIS_VALUES.items()], value="acc",
                                                 label="Value")
                         thesis = gr.Dataframe(pd.DataFrame(), wrap=True)
@@ -1618,6 +1694,7 @@ def build_app():
         components = [name, seed, device, output_dir,
                       dataset, root, image_size, partitioner, alpha, labeled_ratio, batch_size,
                       unl_ratio, num_workers, strong_aug, augment_device, ra_n, ra_m, cutout, split, hflip,
+                      holdout, val_ratio, test_ratio,
                       model_name, norm, model_params,
                       local_epochs, local_steps, optimizer, lr, momentum, weight_decay,
                       prox_mu, grad_clip, precision, channels_last,
@@ -1956,7 +2033,7 @@ def build_app():
                          ", ".join(sorted({r['dataset'] for r in sel}))[:60], "a3")
                   + _kpi("Algorithms", str(len({r['variant'] for r in sel})), "", "a4") + "</div>")
             return (gr.update(choices=datasets), gr.update(choices=algos_found),
-                    gr.update(choices=names, value=chosen), board_df, thesis_df,
+                    gr.update(choices=names, value=chosen), board_df, thesis_display(thesis_df),
                     str(csv_path), str(tex_path), latex, kp, plot_update(run_curves(d, chosen, metric_key),
                                                                  y_title=METRIC_LABELS.get(metric_key, metric_key)),
                     board_order(sel), gr.update(choices=run_choices(sel)))

@@ -8,7 +8,10 @@ Register a new dataset with::
 
     @DATASETS.register("my_dataset")
     def load_my_dataset(cfg: DataConfig) -> tuple[RawDataset, RawDataset]:
-        ...  # return (train, test)
+        ...  # return (train, test), or (train, test, val) when the dataset has a validation split
+
+A third split is only used by ``data.holdout: resplit``, which pools every split and
+re-divides it (the FedLabel paper's 80% train / 5% validation / 15% test).
 """
 from __future__ import annotations
 
@@ -42,6 +45,17 @@ class RawDataset:
     def __len__(self) -> int:
         return len(self.labels)
 
+    def subset(self, idx) -> "RawDataset":
+        return RawDataset(self.images[idx], self.labels[idx], self.num_classes, self.mean, self.std,
+                          self.hflip_safe)
+
+    @staticmethod
+    def concat(parts) -> "RawDataset":
+        """Pool several splits (e.g. train + test) into one; statistics from the first."""
+        first = parts[0]
+        return RawDataset(np.concatenate([p.images for p in parts]), np.concatenate([p.labels for p in parts]),
+                          first.num_classes, first.mean, first.std, first.hflip_safe)
+
     @property
     def in_channels(self) -> int:
         return self.images.shape[-1]
@@ -68,7 +82,7 @@ def load_cifar10(cfg) -> Tuple[RawDataset, RawDataset]:
     return out[0], out[1]
 
 
-def _load_medmnist(cls_name: str, cfg, hflip_safe: bool = True) -> Tuple[RawDataset, RawDataset]:
+def _load_medmnist(cls_name: str, cfg, hflip_safe: bool = True) -> Tuple[RawDataset, ...]:
     import medmnist
 
     cls = getattr(medmnist, cls_name)
@@ -78,11 +92,12 @@ def _load_medmnist(cls_name: str, cfg, hflip_safe: bool = True) -> Tuple[RawData
     if cfg.image_size != 28:
         kwargs["size"] = cfg.image_size
     train = cls(split="train", **kwargs)
+    val = cls(split="val", **kwargs)
     test = cls(split="test", **kwargs)
     num_classes = len(train.info["label"])
     mean, std = _channel_stats(train.imgs)
-    return (RawDataset(train.imgs, train.labels, num_classes, mean, std, hflip_safe),
-            RawDataset(test.imgs, test.labels, num_classes, mean, std, hflip_safe))
+    # (train, test, val): the official validation split is only used by data.holdout = resplit
+    return tuple(RawDataset(d.imgs, d.labels, num_classes, mean, std, hflip_safe) for d in (train, test, val))
 
 
 @DATASETS.register("organamnist")

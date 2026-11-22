@@ -192,7 +192,8 @@ class FedLabel(Strategy):
 
     Parameters
     ----------
-    beta          pseudo-label threshold (ADD: beta).
+    beta          pseudo-label threshold (ADD: beta). Default 0.5: the paper's appendix A (Fig. 10)
+                  finds 0.3-0.5 best and 0.9 the worst (strong augmentation lowers the confidence).
     lambda0       global scale of the consistency weight (ADD: lambda_0).
     lambda_u      weight of the pseudo-label cross-entropy (1 in the ADD).
     sup_steps     tau: SGD steps on labeled data in Step 1 (the paper counts tau in local
@@ -217,7 +218,7 @@ class FedLabel(Strategy):
     param_aliases = {"tau": "beta", "lambda_kl": "lambda0"}            # names before the ADD alignment
     retired_params = ("local_warmup_steps", "temperature")
 
-    def __init__(self, cfg, num_classes, beta: float = 0.95, lambda0: float = 1.0, lambda_u: float = 1.0,
+    def __init__(self, cfg, num_classes, beta: float = 0.5, lambda0: float = 1.0, lambda_u: float = 1.0,
                  sup_epochs: Optional[int] = None, unsup_epochs: Optional[int] = None,
                  confidence: str = "variance", selection: str = "adaptive", kl_direction: str = "add",
                  sup_steps: Optional[int] = None, unsup_steps: Optional[int] = None,

@@ -69,6 +69,7 @@ class Experiment:
                              self.device, seed=cfg.seed)
         self.server.precision = self.strategy.precision(self.device)
         self.test_loader = self.data.test_loader()
+        self.val_loader = self.data.val_loader()     # None unless data.val_ratio > 0
         self.strategy.setup(self)
         self.history: List[Dict[str, float]] = []
         self.setup_s = time.time() - t_setup           # data loading, partitioning, model building
@@ -94,12 +95,21 @@ class Experiment:
         selected = self.server.select_clients()                 # orchestration
         self.strategy.on_server_round_start(self.server, selected, rnd)
         global_state = self.server.broadcast()                  # downlink
-        updates = [c.fit(self.model, global_state, self.strategy, self.device)
-                   for c in selected]                           # local execution + uplink
+        server_s = time.time() - t0
+        updates, client_s = [], []
+        for c in selected:                                      # local execution + uplink
+            t = time.time()
+            updates.append(c.fit(self.model, global_state, self.strategy, self.device))
+            client_s.append(time.time() - t)
+        t = time.time()
         self.strategy.on_server_round_end(self.server, updates, global_state, rnd)
         self.server.aggregate(updates)                          # global aggregation
+        server_s += time.time() - t
 
-        rec: Dict[str, float] = {"round": rnd, "num_clients": len(selected)}
+        # computation cost as in the FedLabel paper's Table 7: local training time per client
+        # and the server's own work (selection, helpers / clustering, thresholds, aggregation)
+        rec: Dict[str, float] = {"round": rnd, "num_clients": len(selected),
+                                 "client_s": float(np.mean(client_s)), "server_s": server_s}
         agg: Dict[str, List[float]] = defaultdict(list)
         for u in updates:
             for k, v in u.metrics.items():
@@ -107,6 +117,9 @@ class Experiment:
         rec.update({f"train_{k}": float(np.mean(v)) for k, v in agg.items()})
         if rnd % self.cfg.server.eval_every == 0 or rnd == self.cfg.server.rounds:
             rec.update(self.server.evaluate(self.test_loader))
+            if self.val_loader is not None:
+                rec.update({"val_" + k[len("test_"):]: v
+                            for k, v in self.server.evaluate(self.val_loader).items()})
         rec["time_s"] = time.time() - t0
         return rec
 
@@ -126,6 +139,12 @@ class Experiment:
         acc = [(r["test_acc"], int(r["round"])) for r in self.history if "test_acc" in r]
         best = max(acc, default=(None, None))
         times = [r["time_s"] for r in self.history if "time_s" in r]
+        val = [(r["val_acc"], int(r["round"]), r.get("test_acc")) for r in self.history if "val_acc" in r]
+        best_val = max(val, key=lambda v: v[0], default=(None, None, None))   # first round on ties
+
+        def mean(key):
+            v = [r[key] for r in self.history if key in r]
+            return round(float(np.mean(v)), 4) if v else None
         summary = {
             "name": self.cfg.name,
             "status": status,                         # running | finished | stopped | error
@@ -140,6 +159,12 @@ class Experiment:
             "best_test_acc": best[0],
             "best_round": best[1],
             "best_test_f1": max((r["test_f1"] for r in self.history if "test_f1" in r), default=None),
+            # model selection on the validation set (data.val_ratio > 0)
+            "best_val_acc": best_val[0],
+            "best_val_round": best_val[1],
+            "test_acc_at_best_val": best_val[2],
+            "mean_client_s": mean("client_s"),        # local training per client per round
+            "mean_server_s": mean("server_s"),
             "final": self.history[-1] if self.history else {},
             "num_workers": self.num_workers,
             "precision": self.server.precision,
@@ -184,6 +209,8 @@ class Experiment:
                 msg += f" | pl_acc {rec['train_pl_acc']:.3f}"
             if "test_acc" in rec:
                 msg += f" | test_acc {rec['test_acc']:.4f}"
+            if "val_acc" in rec:
+                msg += f" | val_acc {rec['val_acc']:.4f}"
             self.log(msg + f" | {rec['time_s']:.1f}s")
             self._write_summary("running")
             for cb in self.callbacks:
@@ -192,7 +219,12 @@ class Experiment:
         torch.save(self.server.global_state, self.out_dir / "global_model.pt")
         self._write_summary("finished")
         best = max((r["test_acc"] for r in self.history if "test_acc" in r), default=None)
-        self.log(f"[ssfl] done. best test_acc={best} | {time.time() - self._t_start:.0f}s")
+        msg = f"[ssfl] done. best test_acc={best}"
+        if self.val_loader is not None:
+            val = [(r["val_acc"], r.get("test_acc")) for r in self.history if "val_acc" in r]
+            if val:
+                msg += f" | test_acc at best val_acc={max(val, key=lambda v: v[0])[1]}"
+        self.log(msg + f" | {time.time() - self._t_start:.0f}s")
         return self.history
 
     def _write_csv(self) -> None:

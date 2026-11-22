@@ -94,7 +94,16 @@ python -m ssfl -c configs/cifar10_fedlabel.yaml --set strategy.prox_mu=0.01     
 `configs/grids/thesis.yaml` lists every run of the thesis: the 3 datasets × 2 label ratios ×
 α ∈ {0.1, 1.0} × the FedLabel paper's comparison (FedAvg, FedProx, FedAvg+FixMatch, FedAvg+UDA,
 FedProx+FixMatch, FedProx+UDA, FedTriNet, FedMatch, FedLabel), FedAvg / FedProx with 100% labels
-(upper bounds) and FedLabel ablations on λ₀, τ (5 / 20 / 50 steps), β, model selection and h(·) (131 runs).
+(upper bounds) and FedLabel ablations on λ₀, τ (5 / 20 / 50 steps), β (0.3 to 0.9), model selection,
+h(·) (max-prob, entropy) and strong augmentation on/off, following the paper and its appendix A.
+Like the paper, the main runs use 3 seeds: 146 runs with seed 42 (the presets' seed) first, then 240 for seeds 43 and 44
+(386 in total). The Results tab averages seeds (mean ± std); `seeds: [42]` gives a single pass.
+
+The paper's test protocol (appendix A) is optional: `data.holdout=resplit data.val_ratio=0.05`
+pools all splits and re-divides them 80% train / 5% validation / 15% test. Any run with a
+validation set (`data.val_ratio > 0`) also records `val_*` metrics and the test accuracy at the
+best validation round. Every round records the local training time per client (`client_s`) and
+the server's own time (`server_s`), as in the paper's computation-cost table (Table 7).
 
 ```bash
 python -m ssfl --grid configs/grids/thesis.yaml --dry-run              # list the runs

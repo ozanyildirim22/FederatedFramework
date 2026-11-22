@@ -100,16 +100,52 @@ class ClientData:
         return self.num_labeled + self.num_unlabeled
 
 
+def make_holdout(parts, mode: str, val_ratio: float, test_ratio: float, seed: int):
+    """``(train, val, test)`` from a loader's splits.
+
+    * ``official`` - the dataset's own train / test split (the ADD). ``val_ratio > 0`` holds
+      out that fraction of the training set as a validation set; 0 = no validation set.
+    * ``resplit`` - every split pooled and divided at random into
+      ``1 - val_ratio - test_ratio`` / ``val_ratio`` / ``test_ratio``: the FedLabel paper's
+      80% / 5% / 15% (appendix A) with ``val_ratio 0.05, test_ratio 0.15``.
+
+    Uses its own random stream, so the default (official, no validation) partitions the
+    clients exactly as before."""
+    train, test = parts[0], parts[1]
+    if mode not in ("official", "resplit"):
+        raise ValueError(f"Unknown holdout '{mode}' (official | resplit)")
+    if not 0 <= val_ratio < 1 or (mode == "resplit" and not 0 < test_ratio < 1 - val_ratio):
+        raise ValueError(f"Bad holdout ratios: val_ratio={val_ratio}, test_ratio={test_ratio}")
+    rng = np.random.default_rng([int(seed), 7919])
+    if mode == "official":
+        if val_ratio <= 0:
+            return train, None, test
+        perm = rng.permutation(len(train))
+        n_val = max(1, int(round(val_ratio * len(train))))
+        return train.subset(np.sort(perm[n_val:])), train.subset(np.sort(perm[:n_val])), test
+    pool = RawDataset.concat(list(parts))
+    perm = rng.permutation(len(pool))
+    n_test = int(round(test_ratio * len(pool)))
+    n_val = int(round(val_ratio * len(pool)))
+    test = pool.subset(np.sort(perm[:n_test]))
+    val = pool.subset(np.sort(perm[n_test:n_test + n_val])) if n_val else None
+    return pool.subset(np.sort(perm[n_test + n_val:])), val, test
+
+
 class DataManager:
     """Loads a dataset, partitions it across clients and builds DataLoaders."""
 
     def __init__(self, cfg, num_clients: int, seed: int = 0, raw=None):
-        """``raw`` = an already loaded ``(train, test)`` pair (skips loading, e.g. a GUI cache)."""
+        """``raw`` = the loader's already loaded splits ``(train, test[, val])`` (skips loading,
+        e.g. a GUI cache)."""
         self.cfg = cfg
         self.num_clients = num_clients
         self.rng = np.random.default_rng(seed)
 
-        self.train, self.test = raw if raw is not None else DATASETS.get(cfg.dataset)(cfg)
+        parts = tuple(raw if raw is not None else DATASETS.get(cfg.dataset)(cfg))
+        self.train, self.val, self.test = make_holdout(
+            parts, getattr(cfg, "holdout", "official"), float(getattr(cfg, "val_ratio", 0.0) or 0.0),
+            float(getattr(cfg, "test_ratio", 0.15)), seed)
         self.num_classes = self.train.num_classes
         self.in_channels = self.train.in_channels
         hflip = getattr(cfg, "hflip", None)
@@ -131,6 +167,7 @@ class DataManager:
             raise ValueError(f"Unknown augment_device '{cfg.augment_device}' (cpu | gpu)")
         self.device = torch.device("cpu")
         self._gpu = None                              # (DeviceDataset train, test, GPUAugment), lazy
+        self._gpu_val = None
 
     @property
     def on_gpu(self) -> bool:
@@ -194,10 +231,24 @@ class DataManager:
         ds = LabeledView(self.test, np.arange(len(self.test)), self.aug.test())
         return self._loader(ds, batch_size, False)
 
+    def val_loader(self, batch_size: int = 256) -> Optional[DataLoader]:
+        """The validation set (``data.val_ratio`` / ``data.holdout``), or None without one."""
+        if self.val is None:
+            return None
+        if self.on_gpu:
+            from .gpu import DeviceDataset, TensorBatches
+            _, _, aug = self._gpu_parts()
+            if self._gpu_val is None:
+                self._gpu_val = DeviceDataset(self.val, self.device)
+            return TensorBatches(self._gpu_val, np.arange(len(self.val)), batch_size, False, "test", aug)
+        return self._loader(LabeledView(self.val, np.arange(len(self.val)), self.aug.test()), batch_size, False)
+
     def summary(self) -> str:
         sizes = np.array([len(p) for p in self.partitions])
         n_lab = sum(len(s[0]) for s in self.splits)
-        return (f"{self.cfg.dataset}: {len(self.train)} train / {len(self.test)} test, "
+        val = f" / {len(self.val)} val" if self.val is not None else ""
+        return (f"{self.cfg.dataset}: {len(self.train)} train{val} / {len(self.test)} test"
+                f"{' (re-split)' if getattr(self.cfg, 'holdout', 'official') == 'resplit' else ''}, "
                 f"{self.num_classes} classes | {self.num_clients} clients "
                 f"({self.cfg.partitioner}, alpha={self.cfg.alpha}) samples/client "
                 f"min={sizes.min()} mean={sizes.mean():.0f} max={sizes.max()} | "

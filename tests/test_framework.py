@@ -146,7 +146,8 @@ def test_thesis_grid_expands():
     from ssfl.grid import expand_grid
     runs = expand_grid("configs/grids/thesis.yaml")
     names = [n for n, _ in runs]
-    assert len(names) == len(set(names)) == 131
+    assert len(names) == len(set(names)) == 386            # 146 with seed 42, then 120 each for 43, 44
+    assert sum(not n.endswith(("_s43", "_s44")) for n in names) == 146
     cfg = dict(runs)["organamnist_fedtrinet_l0p05_a0p1"]
     assert cfg.strategy.name == "fedtrinet" and cfg.data.labeled_ratio == 0.05
     assert "lambda0" not in cfg.strategy.params           # preset params are replaced

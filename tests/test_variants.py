@@ -1,5 +1,6 @@
 """Option-level tests for the newer algorithms (synthetic data, CPU)."""
 import math
+from pathlib import Path
 
 import pytest
 import torch
@@ -522,3 +523,138 @@ def test_organamnist_loader_marks_flip_unsafe(monkeypatch):
     cfg = DataConfig(root=str(__import__("tempfile").gettempdir()))
     assert load_organamnist(cfg)[0].hflip_safe is False
     assert load_pathmnist(cfg)[0].hflip_safe is True
+
+
+# ------------------------------------------------------------- FedLabel appendix A
+def test_holdout_resplit_and_validation_set():
+    import numpy as np
+    from ssfl.config import DataConfig
+    from ssfl.data.datasets import load_synthetic
+    from ssfl.data.manager import DataManager, make_holdout
+    tr, te = load_synthetic(None)
+    # resplit: pool train + test (2,400) and re-divide 80 / 5 / 15, disjoint and complete
+    a, v, t = make_holdout((tr, te), "resplit", 0.05, 0.15, seed=0)
+    assert (len(a), len(v), len(t)) == (1920, 120, 360)
+    pool = np.concatenate([tr.images, te.images]).reshape(2400, -1)
+    seen = {r.tobytes() for r in pool}
+    got = [r.tobytes() for d in (a, v, t) for r in d.images.reshape(len(d), -1)]
+    assert len(got) == 2400 and set(got) == seen
+    a2, _, _ = make_holdout((tr, te), "resplit", 0.05, 0.15, seed=1)
+    assert not np.array_equal(a.labels, a2.labels)                         # the seed changes the split
+    # official + val_ratio: validation carved from the training set, test untouched
+    a, v, t = make_holdout((tr, te), "official", 0.1, 0.15, seed=0)
+    assert (len(a), len(v), t is te) == (1800, 200, True)
+    # default: no validation set, and the client partition is exactly as before
+    dm = DataManager(DataConfig(dataset="synthetic", num_workers=0), 4, seed=0)
+    assert dm.val is None and dm.val_loader() is None and len(dm.train) == 2000
+    old = [np.array(p) for p in dm.partitions]
+    dm2 = DataManager(DataConfig(dataset="synthetic", num_workers=0), 4, seed=0)
+    assert all(np.array_equal(x, y) for x, y in zip(old, dm2.partitions))
+    with pytest.raises(ValueError):
+        make_holdout((tr, te), "nope", 0, 0.15, 0)
+
+
+def test_validation_metrics_timing_and_summary(tmp_path):
+    import json
+    cfg = cfg_for(tmp_path, **{"strategy.name": "fedlabel", "data.holdout": "resplit", "data.val_ratio": 0.05,
+                               "server.eval_every": 1})
+    exp = Experiment(cfg, verbose=False)
+    assert "val" in exp.data.summary() and "re-split" in exp.data.summary()
+    hist = exp.run()
+    assert all({"val_acc", "val_f1", "test_acc", "client_s", "server_s"} <= set(r) for r in hist)
+    assert all(r["client_s"] > 0 and r["server_s"] >= 0 for r in hist)
+    summ = json.loads((exp.out_dir / "summary.json").read_text())
+    best = max(hist, key=lambda r: r["val_acc"])
+    assert summ["best_val_acc"] == best["val_acc"] and summ["test_acc_at_best_val"] == best["test_acc"]
+    assert summ["mean_client_s"] > 0
+    pytest.importorskip("gradio")
+    from ssfl import gui
+    runs = gui.scan_runs(str(tmp_path))
+    assert runs[0]["test_at_val"] == best["test_acc"]
+    html_out = gui.render_run_details(runs[0], exp.out_dir)
+    assert "re-split 80 / 5 / 15%" in html_out and "test acc at best validation" in html_out
+    assert len(gui.thesis_table(runs, "val")) == 1
+
+
+def test_grid_seeds_names_and_order(tmp_path):
+    from ssfl.grid import expand_grid
+    grid = tmp_path / "g.yaml"
+    grid.write_text(
+        "seeds: [0, 1, 2]\n"
+        "algorithms: {fedavg: {}, fedlabel: {}}\n"
+        "experiments:\n"
+        f"  - config: {Path('configs/quick_test.yaml').resolve().as_posix()}\n"
+        "    labeled_ratio: [0.1]\n"
+        f"  - config: {Path('configs/quick_test.yaml').resolve().as_posix()}\n"
+        "    labeled_ratio: [0.1]\n"
+        "    algorithms: [fedlabel]\n"
+        "    tag: abl\n"
+        "    seeds: [0]\n")
+    runs = expand_grid(grid)
+    names = [n for n, _ in runs]
+    base = runs[0][1].seed
+    assert base == 0 and len(names) == 7
+    # all seed-0 runs first (old names, no suffix), then seed 1, then seed 2
+    assert names[:3] == ["synthetic_fedavg_l0p1_a0p5", "synthetic_fedlabel_l0p1_a0p5", "synthetic_fedlabel_l0p1_a0p5_abl"]
+    assert names[3:5] == ["synthetic_fedavg_l0p1_a0p5_s1", "synthetic_fedlabel_l0p1_a0p5_s1"]
+    assert [c.seed for _, c in runs] == [0, 0, 0, 1, 1, 2, 2]
+
+
+def test_thesis_grid_seeds_and_appendix_ablations():
+    from ssfl.config import StrategyConfig
+    from ssfl.grid import expand_grid
+    runs = dict(expand_grid("configs/grids/thesis.yaml"))
+    assert {c.seed for c in runs.values()} == {42, 43, 44}
+    assert "cifar10_fedlabel_l0p2_a0p1_s44" in runs and "organamnist_fedlabel_l0p05_a0p1_beta_0p3_s43" not in runs
+    assert runs["cifar10_fedlabel_l0p2_a0p1"].seed == 42
+    assert runs["organamnist_fedlabel_l0p05_a0p1"].strategy.params["beta"] == 0.5          # appendix A default
+    assert runs["organamnist_fedlabel_l0p05_a0p1_beta_0p95"].strategy.params["beta"] == 0.95
+    assert runs["organamnist_fedlabel_l0p05_a0p1_conf_entropy"].strategy.params["confidence"] == "entropy"
+    assert runs["organamnist_fedlabel_l0p2_a0p1_tau_20"].strategy.params["sup_steps"] == 20
+    assert runs["cifar10_fedlabel_l0p2_a0p1_noaug"].data.strong_aug == "none"
+    assert runs["cifar10_fedlabel_l0p2_a0p1_noaug_beta_0p95"].strategy.params["beta"] == 0.95
+    assert STRATEGIES.get("fedlabel")(StrategyConfig(), 3).beta == 0.5
+
+
+def test_thesis_table_averages_seeds():
+    pytest.importorskip("gradio")
+    from ssfl import gui
+
+    def r(variant, acc, seed, base, mtime=1):
+        return {"base": base, "group": base, "seed": seed, "dataset": "organamnist", "labels": 0.05, "alpha": 0.1,
+                "variant": variant, "best_acc": acc, "finished": True, "mtime": mtime}
+    runs = [r("FedAvg", 0.50, 0, "o_fedavg"), r("FedAvg", 0.54, 1, "o_fedavg_s1"),
+            r("FedLabel", 0.60, 0, "o_fedlabel"), r("FedLabel", 0.70, 1, "o_fedlabel_s1"),
+            r("FedLabel", 0.80, 2, "o_fedlabel_s2"), r("FedMatch", 0.55, 0, "o_fedmatch")]
+    table = gui.thesis_table(runs)
+    col = "organamnist 5% α0.1"
+    assert list(table["algorithm"]) == ["FedAvg", "FedMatch", "FedLabel"]
+    assert table.loc[2, col] == 70.0 and table.attrs["n"].loc[2, col] == 3
+    assert abs(table.attrs["std"].loc[2, col] - 8.16) < 0.01
+    shown = gui.thesis_display(table)
+    assert shown.loc[2, col] == "70 ± 8.16" and shown.loc[1, col] == "55"
+    tex = gui.to_latex(table)
+    assert r"\textbf{70.00} {\scriptsize$\pm$8.16}" in tex and r"55.00 \\" in tex
+    ratio = gui.thesis_table(runs, "ratio")
+    assert abs(ratio.loc[2, col] - 70 / 52) < 1e-3
+
+
+def test_run_labels_from_grid_names(tmp_path):
+    """The α part of a grid name is not a tag; tags and seed suffixes are parsed apart."""
+    pytest.importorskip("gradio")
+    import yaml
+    from ssfl import gui
+    cases = {"organamnist_fedavg_l0p05_a0p1": ("FedAvg", 42),
+             "organamnist_fedlabel_l0p05_a1_s43": ("FedLabel", 43),
+             "organamnist_fedlabel_l0p05_a0p1_beta_0p5": ("FedLabel (beta_0p5)", 42),
+             "organamnist_fixmatch_l0p05_a0p1_prox_s44": ("FedProx+FixMatch", 44),
+             "organamnist_fedlabel_l0p05": ("FedLabel", 42)}
+    for name, (label, seed) in cases.items():
+        d = tmp_path / f"{name}_20261122-120000"
+        d.mkdir()
+        algo = name.split("_")[1]
+        prox = 0.01 if "prox" in name else 0.0
+        (d / "config.yaml").write_text(yaml.safe_dump({"seed": seed, "strategy": {"name": algo, "prox_mu": prox}}))
+        (d / "metrics.csv").write_text("round,test_acc\n1,0.5\n")
+    got = {r["base"]: (r["variant"], r["seed"]) for r in gui.scan_runs(str(tmp_path))}
+    assert got == cases

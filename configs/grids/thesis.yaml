@@ -8,6 +8,21 @@
 # Finished runs (summary.json with status "finished") are skipped, so the grid can be resumed.
 # Extra --set overrides apply to every run, e.g. --set output_dir=/content/drive/MyDrive/ssfl/runs
 
+# 3 seeds, averaged (FedLabel paper, appendix A); the Results tab shows mean ± std. The grid runs
+# every experiment with seed 42 (the presets' seed) first, then 43, then 44, so stopping early leaves full
+# tables. Seed 42 runs keep their old names (no suffix); seeds 43 and 44 add _s43 / _s44.
+# Use seeds: [42] for a single pass. The ablations below run with seed 42 only.
+seeds: [42, 43, 44]
+
+# The FedLabel paper's test protocol (appendix A): pool all splits and re-divide 80% train /
+# 5% validation / 15% test; the Results tab then also offers "test accuracy at the best
+# validation round". The ADD uses the datasets' official test sets (the default). Switching this
+# changes every run, so give such a grid its own output_dir:
+# common:
+#   data.holdout: resplit
+#   data.val_ratio: 0.05
+#   data.test_ratio: 0.15
+
 algorithms:
   fedavg: {}                         # labeled data only (the ADD's low baseline)
   fedprox:
@@ -33,7 +48,7 @@ algorithms:
     lambda_u: 1.0
     finetune_steps: 5
   fedlabel:                           # ADD Section 3.1 / Algorithm 2
-    beta: 0.95
+    beta: 0.5                         # paper appendix A (Fig. 10): 0.3-0.5 best, 0.9 the worst
     lambda0: 1.0
     lambda_u: 1.0
     sup_epochs: 1
@@ -77,28 +92,66 @@ experiments:
     alpha: [0.1, 1.0]
     algorithms: [fedavg, fedprox]
 
-  # FedLabel ablations (ADD Section 5.1): OrganAMNIST, 5% labels, alpha = 0.1
-  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel],
+  # FedLabel ablations (ADD Section 5.1; paper Section 5.2 and appendix A): seed 42 only
+  # OrganAMNIST, 5% labels, alpha = 0.1
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel], seeds: [42],
      tag: lambda0_0, algorithm_params: {fedlabel: {lambda0: 0.0}}}
-  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel],
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel], seeds: [42],
      tag: lambda0_0p5, algorithm_params: {fedlabel: {lambda0: 0.5}}}
-  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel],
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel], seeds: [42],
      tag: lambda0_2, algorithm_params: {fedlabel: {lambda0: 2.0}}}
   # tau in local SGD steps, as in the paper's ablation (tau = 5 was the worst there)
-  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel],
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel], seeds: [42],
      tag: tau_5, algorithm_params: {fedlabel: {sup_steps: 5}}}
-  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel],
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel], seeds: [42],
      tag: tau_20, algorithm_params: {fedlabel: {sup_steps: 20}}}
-  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel],
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel], seeds: [42],
      tag: tau_50, algorithm_params: {fedlabel: {sup_steps: 50}}}
-  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel],
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel], seeds: [42],
      tag: beta_0p8, algorithm_params: {fedlabel: {beta: 0.8}}}
-  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel],
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel], seeds: [42],
      tag: beta_0p9, algorithm_params: {fedlabel: {beta: 0.9}}}
   # model-selection ablations: always local / always global, and max-probability confidence
-  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel],
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel], seeds: [42],
      tag: sel_local, algorithm_params: {fedlabel: {selection: local}}}
-  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel],
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel], seeds: [42],
      tag: sel_global, algorithm_params: {fedlabel: {selection: global}}}
-  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel],
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel], seeds: [42],
      tag: conf_maxprob, algorithm_params: {fedlabel: {confidence: max_prob}}}
+  # beta around the default 0.5: the appendix (Fig. 10) finds 0.3-0.5 best and 0.9 the worst;
+  # 0.95 is the FixMatch-style threshold used before
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel], seeds: [42],
+     tag: beta_0p3, algorithm_params: {fedlabel: {beta: 0.3}}}
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel], seeds: [42],
+     tag: beta_0p95, algorithm_params: {fedlabel: {beta: 0.95}}}
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel], seeds: [42],
+     tag: beta_0p7, algorithm_params: {fedlabel: {beta: 0.7}}}
+  # h(.) = entropy instead of variance (appendix Fig. 11: variance is better on OrganAMNIST)
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel], seeds: [42],
+     tag: conf_entropy, algorithm_params: {fedlabel: {confidence: entropy}}}
+  # tau with more labels (appendix Fig. 12): OrganAMNIST, 20% labels
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.2], alpha: [0.1], algorithms: [fedlabel], seeds: [42],
+     tag: tau_5, algorithm_params: {fedlabel: {sup_steps: 5}}}
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.2], alpha: [0.1], algorithms: [fedlabel], seeds: [42],
+     tag: tau_20, algorithm_params: {fedlabel: {sup_steps: 20}}}
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.2], alpha: [0.1], algorithms: [fedlabel], seeds: [42],
+     tag: tau_50, algorithm_params: {fedlabel: {sup_steps: 50}}}
+
+  # CIFAR-10, 20% labels, alpha = 0.1: lambda_0 (paper Fig. 6), beta (Fig. 10), h(.) (Fig. 11)
+  - {config: configs/cifar10_fedlabel.yaml, labeled_ratio: [0.2], alpha: [0.1], algorithms: [fedlabel], seeds: [42],
+     tag: lambda0_0, algorithm_params: {fedlabel: {lambda0: 0.0}}}
+  - {config: configs/cifar10_fedlabel.yaml, labeled_ratio: [0.2], alpha: [0.1], algorithms: [fedlabel], seeds: [42],
+     tag: lambda0_2, algorithm_params: {fedlabel: {lambda0: 2.0}}}
+  - {config: configs/cifar10_fedlabel.yaml, labeled_ratio: [0.2], alpha: [0.1], algorithms: [fedlabel], seeds: [42],
+     tag: beta_0p3, algorithm_params: {fedlabel: {beta: 0.3}}}
+  - {config: configs/cifar10_fedlabel.yaml, labeled_ratio: [0.2], alpha: [0.1], algorithms: [fedlabel], seeds: [42],
+     tag: beta_0p95, algorithm_params: {fedlabel: {beta: 0.95}}}
+  - {config: configs/cifar10_fedlabel.yaml, labeled_ratio: [0.2], alpha: [0.1], algorithms: [fedlabel], seeds: [42],
+     tag: beta_0p9, algorithm_params: {fedlabel: {beta: 0.9}}}
+  - {config: configs/cifar10_fedlabel.yaml, labeled_ratio: [0.2], alpha: [0.1], algorithms: [fedlabel], seeds: [42],
+     tag: conf_entropy, algorithm_params: {fedlabel: {confidence: entropy}}}
+  # without strong augmentation (appendix Fig. 9: CIFAR-10, with and without RandAugment over beta)
+  - {config: configs/cifar10_fedlabel.yaml, labeled_ratio: [0.2], alpha: [0.1], algorithms: [fedlabel], seeds: [42],
+     tag: noaug, overrides: {data.strong_aug: none}}
+  - {config: configs/cifar10_fedlabel.yaml, labeled_ratio: [0.2], alpha: [0.1], algorithms: [fedlabel], seeds: [42],
+     tag: noaug_beta_0p95, overrides: {data.strong_aug: none}, algorithm_params: {fedlabel: {beta: 0.95}}}
