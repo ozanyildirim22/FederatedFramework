@@ -7,7 +7,7 @@ algorithms:
   fedprox: {mu: 0.01}
   fedmatch: {}
   fedtrinet: {pretrain_rounds: 2, finetune_steps: 1}
-  fedlabel: {tau: 0.8}
+  fedlabel: {beta: 0.8}
 experiments:
   - config: configs/quick_test.yaml
     labeled_ratio: [0.1, 0.2]

@@ -1,4 +1,4 @@
-"""Run a grid of experiments (datasets x label ratios x algorithms) from one YAML file.
+"""Run a grid of experiments (datasets x label ratios x alpha x algorithms) from one YAML file.
 
     python -m ssfl --grid configs/grids/thesis.yaml               # run everything
     python -m ssfl --grid configs/grids/thesis.yaml --dry-run     # list the runs only
@@ -9,15 +9,16 @@ Grid file layout::
     common: {server.eval_every: 5}          # overrides for every run (optional)
     algorithms:                             # name -> strategy.params (replaces the preset's params)
       fedavg: {}
-      fedlabel: {tau: 0.95, lambda_kl: 1.0}
+      fedlabel: {beta: 0.95, lambda0: 1.0}
     experiments:
       - config: configs/organamnist_fedlabel.yaml
         labeled_ratio: [0.05, 0.2]
+        alpha: [0.1, 1.0]                   # optional Dirichlet alpha values (default: the preset's)
         overrides: {server.rounds: 100}     # optional, for this experiment only
         algorithm_params: {fedtrinet: {pretrain_rounds: 20}}   # optional, merged into the params
         algorithms: [fedavg, fedlabel]      # optional subset (default: all)
 
-Every run is named ``<dataset>_<algorithm>_l<ratio>[_<tag>]``. A run whose name
+Every run is named ``<dataset>_<algorithm>_l<ratio>_a<alpha>[_<tag>]``. A run whose name
 already has a ``summary.json`` in ``output_dir`` is skipped, so an interrupted
 grid (for example a Colab session that timed out) continues where it stopped.
 Use ``--no-resume`` to run everything again.
@@ -62,25 +63,27 @@ def expand_grid(path: str | Path, extra: Optional[Sequence[str]] = None
         raw = apply_overrides(raw, exp.get("overrides") or {})
         ratios = exp.get("labeled_ratio") or [raw.get("data", {}).get("labeled_ratio", 0.2)]
         ratios = ratios if isinstance(ratios, list) else [ratios]
+        alphas = exp.get("alpha") or [raw.get("data", {}).get("alpha", 0.5)]
+        alphas = alphas if isinstance(alphas, list) else [alphas]
         names = exp.get("algorithms") or list(algorithms)
-        for ratio in ratios:
-            for algo in names:
-                if algo not in algorithms:
-                    raise KeyError(f"Algorithm '{algo}' is not defined under 'algorithms'")
-                params = copy.deepcopy(algorithms[algo] or {})
-                params.update((exp.get("algorithm_params") or {}).get(algo) or {})
-                r = copy.deepcopy(raw)
-                r.setdefault("data", {})["labeled_ratio"] = ratio
-                strat = r.setdefault("strategy", {})
-                strat["name"] = algo
-                strat["params"] = params
-                dataset = r["data"].get("dataset", "data")
-                name = f"{dataset}_{algo}_l{_ratio_tag(ratio)}"
-                if exp.get("tag"):
-                    name += f"_{exp['tag']}"
-                r["name"] = name
-                r = apply_overrides(r, list(extra or []))
-                runs.append((name, ExperimentConfig.from_dict(r)))
+        for ratio, alpha, algo in ((r_, a_, n_) for r_ in ratios for a_ in alphas for n_ in names):
+            if algo not in algorithms:
+                raise KeyError(f"Algorithm '{algo}' is not defined under 'algorithms'")
+            params = copy.deepcopy(algorithms[algo] or {})
+            params.update((exp.get("algorithm_params") or {}).get(algo) or {})
+            r = copy.deepcopy(raw)
+            r.setdefault("data", {})["labeled_ratio"] = ratio
+            r["data"]["alpha"] = alpha
+            strat = r.setdefault("strategy", {})
+            strat["name"] = algo
+            strat["params"] = params
+            dataset = r["data"].get("dataset", "data")
+            name = f"{dataset}_{algo}_l{_ratio_tag(ratio)}_a{_ratio_tag(alpha)}"
+            if exp.get("tag"):
+                name += f"_{exp['tag']}"
+            r["name"] = name
+            r = apply_overrides(r, list(extra or []))
+            runs.append((name, ExperimentConfig.from_dict(r)))
     return runs
 
 

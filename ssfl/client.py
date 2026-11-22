@@ -39,7 +39,12 @@ class Client:
         model.load_state_dict(global_state)
         model.to(device)
         # 2) local execution (training protocol + pseudo-labeling engine + loss)
+        strategy.aggregation_weight = None
         metrics = strategy.local_train(model, self, device)
+        # a strategy may report its own aggregation weight r_k (FedLabel: samples actually
+        # used this round); otherwise the server weighs by the client's dataset size
+        weight = strategy.aggregation_weight
+        num_samples = self.num_samples if weight is None else weight
         # 3) compute the update vector delta_w_k (only numbers leave the device)
         delta, buffers = {}, {}
         for k, v in model.state_dict().items():
@@ -48,4 +53,4 @@ class Client:
                 delta[k] = v - global_state[k]
             else:
                 buffers[k] = v.clone()
-        return ClientUpdate(self.id, delta, buffers, self.num_samples, self.data.num_labeled, metrics)
+        return ClientUpdate(self.id, delta, buffers, num_samples, self.data.num_labeled, metrics)

@@ -89,7 +89,7 @@ def test_gui_config_roundtrip_and_build():
         multi = gui.build_configs(gui.cfg_to_values(cfg), ["fedavg", "fedmatch"], {"fedmatch": {"tau": 0.7}})
         assert [c.strategy.name for c in multi] == ["fedavg", "fedmatch"]
         assert multi[1].strategy.params == {"tau": 0.7} and multi[0].name != multi[1].name
-    assert "tau" in gui.default_params(STRATEGIES.get("fedlabel"))
+    assert {"beta", "lambda0", "sup_epochs"} <= set(gui.default_params(STRATEGIES.get("fedlabel")))
     assert "weight_by" in gui.default_params(AGGREGATORS.get("fedadam"))
     gui.build_app()
     assert "Ready" in gui.render_status(gui.RunController().snapshot())
@@ -146,10 +146,10 @@ def test_thesis_grid_expands():
     from ssfl.grid import expand_grid
     runs = expand_grid("configs/grids/thesis.yaml")
     names = [n for n, _ in runs]
-    assert len(names) == len(set(names)) == 33
-    cfg = dict(runs)["organamnist_fedtrinet_l0p05"]
+    assert len(names) == len(set(names)) == 131
+    cfg = dict(runs)["organamnist_fedtrinet_l0p05_a0p1"]
     assert cfg.strategy.name == "fedtrinet" and cfg.data.labeled_ratio == 0.05
-    assert "lambda_kl" not in cfg.strategy.params         # preset params are replaced
-    assert dict(runs)["cifar10_fedtrinet_l0p2"].strategy.params["pretrain_rounds"] == 40
+    assert "lambda0" not in cfg.strategy.params           # preset params are replaced
+    assert dict(runs)["cifar10_fedtrinet_l0p2_a1"].strategy.params["pretrain_rounds"] == 200
     for name, cfg in runs:                                 # every param set is accepted
         STRATEGIES.build(cfg.strategy.name, cfg.strategy, 10, **cfg.strategy.params)

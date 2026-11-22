@@ -144,7 +144,7 @@ def test_grid_only_resume_and_overrides(tmp_path, capsys):
     main(args)
     first = capsys.readouterr().out
     assert first.count("[grid") == 1 and ": run" in first          # --only keeps one run
-    done = list((tmp_path / "gridruns").glob("synthetic_fedavg_l0p1_demo_*/summary.json"))
+    done = list((tmp_path / "gridruns").glob("synthetic_fedavg_l0p1_a0p5_demo_*/summary.json"))
     assert len(done) == 1
     cfg = ExperimentConfig.from_yaml(done[0].parent / "config.yaml")
     assert cfg.server.rounds == 1 and cfg.output_dir == out          # --set reached the run
@@ -152,7 +152,7 @@ def test_grid_only_resume_and_overrides(tmp_path, capsys):
     assert "skip (finished)" in capsys.readouterr().out             # resume skips it
     main(args + ["--no-resume"])
     assert ": run" in capsys.readouterr().out
-    assert len(list((tmp_path / "gridruns").glob("synthetic_fedavg_l0p1_demo_*"))) == 2
+    assert len(list((tmp_path / "gridruns").glob("synthetic_fedavg_l0p1_a0p5_demo_*"))) == 2
     main(["--grid", "configs/grids/demo.yaml", "--dry-run", "--set", f"output_dir={out}"])
     dry = capsys.readouterr().out
     assert dry.count("[grid") == 10 and dry.count("skip (finished)") == 1
@@ -282,8 +282,9 @@ def test_run_records_full_params_timing_and_status(tmp_path):
     exp = Experiment(cfg, verbose=False)
     exp.run()
     saved = yaml.safe_load((exp.out_dir / "config.yaml").read_text())
-    assert saved["strategy"]["params"]["tau"] == 0.7                        # the given value
-    assert saved["strategy"]["params"]["lambda_kl"] == 1.0                  # defaults written out too
+    assert saved["strategy"]["params"]["beta"] == 0.7                       # old name `tau` renamed
+    assert "tau" not in saved["strategy"]["params"]
+    assert saved["strategy"]["params"]["lambda0"] == 1.0                    # defaults written out too
     assert "weight_by" in saved["server"]["params"]
     assert cfg.strategy.params == {"tau": 0.7}                              # caller's config untouched
     summ = json.loads((exp.out_dir / "summary.json").read_text())
@@ -318,3 +319,156 @@ def test_results_tab_helpers(tmp_path):
     assert "FedMatch parameters" in html_out and "lambda_iccs" in html_out and "Environment" in html_out
     acc, loss = gui.detail_frames(exp.out_dir)
     assert len(acc) and len(loss)
+
+
+# ------------------------------------------------------------- ADD alignment
+def test_fedlabel_two_phase_update_is_sum_of_deltas(tmp_path):
+    """Eq. 4: the uploaded update is dw_L + dw_U, both computed from W_t."""
+    from ssfl.strategies.base import round_batches
+    exp = Experiment(cfg_for(tmp_path, **{"strategy.name": "fedlabel", "strategy.local_steps": 3,
+                                          "strategy.params": {"beta": 0.0}}), verbose=False)
+    s, client, model = exp.strategy, exp.clients[0], exp.model
+    w0 = {k: v.clone() for k, v in exp.server.global_state.items()}
+    calls = []
+    orig = s.optimize
+
+    def spy(m, steps, lab_it, unl_it, loss_fn=None, sums=None):
+        start = {k: v.clone() for k, v in m.state_dict().items()}
+        out = orig(m, steps, lab_it, unl_it, loss_fn, sums)
+        calls.append((start, {k: v.clone() for k, v in m.state_dict().items()}, lab_it is not None))
+        return out
+    s.optimize = spy
+    model.load_state_dict(w0)
+    metrics = s.local_train(model, client, torch.device("cpu"))
+    assert [c[2] for c in calls] == [True, False]                    # supervised, then unlabeled
+    for start, _, _ in calls:                                         # both phases start from W_t
+        assert all(torch.equal(start[k], w0[k]) for k in w0 if w0[k].is_floating_point())
+    expect = {k: w0[k] + (calls[0][1][k] - w0[k]) + (calls[1][1][k] - w0[k]) for k in w0 if w0[k].is_floating_point()}
+    assert all(torch.allclose(model.state_dict()[k], v, atol=1e-6) for k, v in expect.items())
+    assert {"loss_sup", "loss_unsup", "loss_kl", "kl_rate", "local_selected"} <= set(metrics)
+
+
+def test_fedlabel_selection_threshold_and_kl_weight():
+    import torch.nn as nn
+    from ssfl.config import StrategyConfig
+
+    class Fixed(nn.Module):
+        def __init__(self, out):
+            super().__init__()
+            self.out = out
+
+        def forward(self, x):
+            return self.out[: len(x)]
+    s = STRATEGIES.build("fedlabel", StrategyConfig(), 3, beta=0.6, lambda0=2.0)
+    G = torch.tensor([[5., 0, 0], [0, 5., 0], [1., 0.9, 0], [0, 0, 6.]])
+    L = torch.tensor([[4., 0, 0], [0, 9., 0], [0, 0, 1.], [8., 0, 0]])
+    s.global_model, s.local_model = Fixed(G), Fixed(L)
+    student = nn.Linear(1, 3)
+    x = torch.zeros(4, 1)
+    _, logs = s._unsup_loss(student, None, (x, x, torch.tensor([0, 1, 2, 2])))
+    hG, hL = G.var(1, unbiased=False), L.var(1, unbiased=False)       # h = variance of the logits
+    assert float(logs["local_selected"]) == 0.75                       # samples 1, 2, 3 pick the local model
+    assert float(logs["mask_rate"]) == 0.75                            # sample 2 is below beta
+    assert float(logs["kl_rate"]) == 0.5                               # sample 3: the other model disagrees
+    lam = (2 * hL[0] / hG[0] + 2 * hG[1] / hL[1]) / 2                  # lambda0 * h(s_bar) / h(s*)
+    assert abs(float(logs["lambda_k"]) - float(lam)) < 1e-5
+
+
+def test_fedlabel_accepts_old_parameter_names():
+    from ssfl.config import StrategyConfig
+    s = STRATEGIES.build("fedlabel", StrategyConfig(), 10, tau=0.7, lambda_kl=0.3, local_warmup_steps=5)
+    assert (s.beta, s.lambda0) == (0.7, 0.3)
+
+
+def test_macro_metrics_and_random_split():
+    import numpy as np
+    from ssfl.data.partition import split_labeled_unlabeled
+    from ssfl.server.server import classification_metrics
+    conf = torch.tensor([[8, 2, 0], [1, 4, 0], [0, 0, 0]])           # class 2 absent from the test set
+    m = classification_metrics(conf)
+    assert abs(m["test_acc"] - 12 / 15) < 1e-9
+    assert abs(m["test_recall"] - (0.8 + 0.8) / 2) < 1e-9               # absent class skipped
+    p0, p1 = 8 / 9, 4 / 6
+    assert abs(m["test_precision"] - (p0 + p1) / 2) < 1e-9
+    labels = np.repeat(np.arange(10), 100)
+    lab, unl = split_labeled_unlabeled(np.arange(1000), labels, 0.2, np.random.default_rng(0), mode="random")
+    assert len(lab) == 200 and len(np.intersect1d(lab, unl)) == 0
+
+
+def test_strong_view_follows_add_by_default():
+    from ssfl.config import DataConfig
+    from ssfl.data.augment import AugmentationFactory
+    d = DataConfig()
+    assert (d.randaugment_n, d.randaugment_m, d.cutout, d.split) == (1, 10, False, "random")
+    strong = AugmentationFactory(32, (0.5,) * 3, (0.25,) * 3, "randaugment", d.randaugment_n, d.randaugment_m).strong()
+    names = [type(t).__name__ for t in strong.transforms]
+    assert "RandAugment" in names and "RandomErasing" not in names
+    assert next(t for t in strong.transforms if type(t).__name__ == "RandAugment").num_ops == 1
+
+
+def test_thesis_grid_follows_add():
+    from ssfl.grid import expand_grid
+    runs = dict(expand_grid("configs/grids/thesis.yaml"))
+    assert {c.data.alpha for c in runs.values()} == {0.1, 1.0}
+    assert {c.server.rounds for c in runs.values()} == {1000}
+    assert {"organamnist_uda_l0p05_a0p1", "organamnist_fixmatch_l0p05_a0p1_prox", "organamnist_fedprox_l1_a0p1"} <= set(runs)
+    assert "organamnist_fedavg_l1_a0p1" in runs                          # high baseline, 100% labels
+    assert runs["cifar10_fedlabel_l0p2_a0p1"].model.name == "resnet34"
+    assert {"lambda0_0", "tau_5", "tau_50", "beta_0p8"} <= {n.split("_a0p1_")[-1] for n in runs if "_a0p1_" in n}
+
+
+# ------------------------------------------------------------- FedLabel paper alignment
+def test_fedlabel_aggregation_weight_is_samples_used(tmp_path):
+    """Paper Alg. 1: r_k = labeled samples processed + unlabeled samples past the threshold."""
+    from ssfl.client import ClientUpdate
+    exp = Experiment(cfg_for(tmp_path, **{"strategy.name": "fedlabel", "strategy.params":
+                                          {"beta": 0.0, "sup_steps": 2, "unsup_steps": 3}}), verbose=False)
+    client = exp.clients[0]
+    upd: ClientUpdate = client.fit(exp.model, exp.server.broadcast(), exp.strategy, torch.device("cpu"))
+    lab_bs = client.data.labeled.batch_size
+    assert upd.metrics["used_samples"] == upd.num_samples
+    assert upd.num_samples >= 2 * lab_bs                           # tau = 2 labeled steps counted
+    assert upd.num_samples <= 2 * lab_bs + 3 * client.data.unlabeled.batch_size
+    exp2 = Experiment(cfg_for(tmp_path, **{"strategy.name": "fedlabel",
+                                           "strategy.params": {"weight_by_used": False}}), verbose=False)
+    upd2 = exp2.clients[0].fit(exp2.model, exp2.server.broadcast(), exp2.strategy, torch.device("cpu"))
+    assert upd2.num_samples == exp2.clients[0].num_samples          # dataset size instead
+
+
+def test_fedlabel_steps_override_epochs():
+    from ssfl.config import StrategyConfig
+    s = STRATEGIES.build("fedlabel", StrategyConfig(local_epochs=3), 10, sup_steps=7, unsup_steps=11)
+    loader = list(range(4))                                         # 4 batches
+    assert s._phase_steps(loader, s.sup_epochs, s.sup_steps) == 7
+    assert s._phase_steps(loader, s.unsup_epochs, None) == 12       # 3 epochs x 4 batches
+
+
+def test_fedlabel_threshold_is_strict():
+    import torch.nn as nn
+    from ssfl.config import StrategyConfig
+
+    class Fixed(nn.Module):
+        def __init__(self, out):
+            super().__init__()
+            self.out = out
+
+        def forward(self, x):
+            return self.out[: len(x)]
+    s = STRATEGIES.build("fedlabel", StrategyConfig(), 2, beta=0.5)
+    s.global_model = s.local_model = Fixed(torch.tensor([[0.0, 0.0]]))   # max prob exactly 0.5
+    _, logs = s._unsup_loss(nn.Linear(1, 2), None, (torch.zeros(1, 1), torch.zeros(1, 1), torch.tensor([0])))
+    assert float(logs["mask_rate"]) == 0.0                          # 0.5 is not > beta = 0.5
+
+
+@pytest.mark.parametrize("prox", [0.0, 0.01])
+def test_uda_runs(tmp_path, prox):
+    hist = run(cfg_for(tmp_path, **{"strategy.name": "uda", "strategy.prox_mu": prox, "strategy.params": {}}))
+    assert "train_loss_unsup" in hist[-1] and 0 <= hist[-1]["train_mask_rate"] <= 1
+
+
+def test_paper_baseline_labels():
+    pytest.importorskip("gradio")
+    from ssfl import gui
+    assert gui._variant("fixmatch", {"prox_mu": 0.01}, "prox") == "FedProx+FixMatch"
+    assert gui._variant("uda", {"prox_mu": 0}, None) == "FedAvg+UDA"
+    assert gui._variant("fedlabel", {}, "tau_5") == "FedLabel (tau_5)"

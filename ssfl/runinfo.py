@@ -32,8 +32,16 @@ def default_params(cls) -> Dict[str, Any]:
 
 
 def full_params(cls, given: Dict[str, Any]) -> Dict[str, Any]:
-    """Every parameter the component runs with: its defaults, overridden by ``given``."""
-    return {**default_params(cls), **(given or {})}
+    """Every parameter the component runs with: its defaults, overridden by ``given``.
+    Old parameter names (``cls.param_aliases``: old -> new) are renamed and retired ones
+    (``cls.retired_params``) dropped, so a saved config never lists one value twice."""
+    given = dict(given or {})
+    for old, new in getattr(cls, "param_aliases", {}).items():
+        if old in given:
+            given[new] = given.pop(old)              # same precedence as the constructor
+    for old in getattr(cls, "retired_params", ()):
+        given.pop(old, None)
+    return {**default_params(cls), **given}
 
 
 def code_version() -> str:

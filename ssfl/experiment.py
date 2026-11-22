@@ -139,6 +139,7 @@ class Experiment:
             "mean_round_s": round(sum(times) / len(times), 3) if times else None,
             "best_test_acc": best[0],
             "best_round": best[1],
+            "best_test_f1": max((r["test_f1"] for r in self.history if "test_f1" in r), default=None),
             "final": self.history[-1] if self.history else {},
             "num_workers": self.num_workers,
             "precision": self.server.precision,

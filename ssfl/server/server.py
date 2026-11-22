@@ -44,15 +44,35 @@ class Server:
         self.model.to(self.device).eval()
         prec = getattr(self, "precision", "fp32")      # set by Experiment from the strategy
         dtype = torch.bfloat16 if prec == "bf16" else torch.float16
-        correct = torch.zeros((), device=self.device)
         loss = torch.zeros((), device=self.device)
-        total = 0
+        conf = None                                     # confusion matrix [true, predicted]
         for x, y in loader:
             x, y = x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
             with torch.autocast(self.device.type, dtype=dtype, enabled=prec != "fp32"):
                 logits = self.model(x)
             logits = logits.float()
+            n_cls = logits.shape[1]
+            if conf is None:
+                conf = torch.zeros(n_cls * n_cls, dtype=torch.long, device=self.device)
             loss += nn.functional.cross_entropy(logits, y, reduction="sum")
-            correct += (logits.argmax(1) == y).sum()
-            total += y.numel()
-        return {"test_acc": float(correct) / total, "test_loss": float(loss) / total}
+            conf += torch.bincount(y * n_cls + logits.argmax(1), minlength=n_cls * n_cls)
+        return classification_metrics(conf.view(n_cls, n_cls).cpu(), float(loss))
+
+
+def classification_metrics(confusion: torch.Tensor, loss_sum: float = 0.0) -> Dict[str, float]:
+    """Top-1 accuracy (correct / total) and **macro-averaged** precision, recall and F1
+    over the classes (the ADD's Eq. 6, 8, 9 for the multi-class case), from a confusion
+    matrix ``[true, predicted]``. Classes that never occur in the test set are skipped for
+    recall / F1; a class never predicted has precision 0."""
+    c = confusion.double()
+    total = c.sum().clamp_min(1)
+    tp = c.diag()
+    support, predicted = c.sum(1), c.sum(0)
+    present = support > 0
+    precision = torch.where(predicted > 0, tp / predicted.clamp_min(1), torch.zeros_like(tp))
+    recall = tp / support.clamp_min(1)
+    f1 = torch.where(precision + recall > 0, 2 * precision * recall / (precision + recall).clamp_min(1e-12),
+                     torch.zeros_like(tp))
+    return {"test_acc": float(tp.sum() / total), "test_loss": loss_sum / float(total),
+            "test_precision": float(precision[present].mean()), "test_recall": float(recall[present].mean()),
+            "test_f1": float(f1[present].mean())}

@@ -113,12 +113,14 @@ class DataManager:
         self.num_classes = self.train.num_classes
         self.in_channels = self.train.in_channels
         self.aug = AugmentationFactory(self.train.image_size, self.train.mean, self.train.std,
-                                       cfg.strong_aug, cfg.randaugment_n, cfg.randaugment_m)
+                                       cfg.strong_aug, cfg.randaugment_n, cfg.randaugment_m,
+                                       cutout=getattr(cfg, "cutout", False))
 
         self.partitions: List[np.ndarray] = PARTITIONERS.get(cfg.partitioner)(
             self.train.labels, num_clients, self.rng, alpha=cfg.alpha,
             min_samples_per_client=cfg.min_samples_per_client)
-        self.splits = [split_labeled_unlabeled(p, self.train.labels, cfg.labeled_ratio, self.rng)
+        self.splits = [split_labeled_unlabeled(p, self.train.labels, cfg.labeled_ratio, self.rng,
+                                               mode=getattr(cfg, "split", "random"))
                        for p in self.partitions]
 
         # data.num_workers = -1 means "auto"; resolve_workers() picks the number
@@ -140,7 +142,8 @@ class DataManager:
         if self._gpu is None:
             from .gpu import DeviceDataset, GPUAugment
             aug = GPUAugment(self.train.image_size, self.train.mean, self.train.std, self.cfg.strong_aug,
-                             self.cfg.randaugment_n, self.cfg.randaugment_m, device=self.device)
+                             self.cfg.randaugment_n, self.cfg.randaugment_m, device=self.device,
+                             cutout=getattr(self.cfg, "cutout", False))
             self._gpu = (DeviceDataset(self.train, self.device), DeviceDataset(self.test, self.device), aug)
         return self._gpu
 

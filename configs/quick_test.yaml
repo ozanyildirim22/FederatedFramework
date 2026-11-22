@@ -17,7 +17,7 @@ strategy:
   name: fedlabel
   local_steps: 5
   lr: 0.05
-  params: {tau: 0.8}
+  params: {beta: 0.8}
 server:
   aggregator: fedavg
   rounds: 3

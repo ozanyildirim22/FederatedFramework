@@ -6,7 +6,7 @@ data:
   dataset: cifar10
   root: ./data
   partitioner: dirichlet
-  alpha: 0.5
+  alpha: 1.0                  # ADD: 1.0 (near-IID) and 0.1 (severe non-IID)
   labeled_ratio: 0.2          # thesis: 0.2 and 0.5
   batch_size: 32
   unlabeled_batch_ratio: 7
@@ -17,18 +17,18 @@ strategy:
   name: fedlabel              # supervised | pseudolabel | fixmatch | fedlabel
   local_epochs: 1
   lr: 0.03
-  amp: false                # true = mixed precision (less VRAM, small speed-up)
-  params:
-    tau: 0.95
-    lambda_u: 1.0
-    lambda_kl: 1.0
-    temperature: 1.0
-    confidence: variance      # variance | max_prob | entropy
-    selection: adaptive       # adaptive | local | global
-    local_warmup_steps: 5
+  params:                     # FedLabel as in the ADD (Section 3.1, Algorithm 2)
+    beta: 0.95                # pseudo-label confidence threshold (beta)
+    lambda0: 1.0              # scale of the global-local consistency weight (lambda_0)
+    lambda_u: 1.0             # weight of the pseudo-label cross-entropy
+    sup_epochs: 1             # tau: epochs on labeled data (Step 1)
+    unsup_epochs: 1           # tau': epochs on unlabeled data (Steps 2-3)
+    confidence: variance      # h(.) = variance of the logits
+    selection: adaptive       # adaptive | local | global (ablations)
+    kl_direction: add         # add = KL(s(w_U) || s_bar) as in Eq. 2 | teacher
 server:
   aggregator: fedavg
-  rounds: 200
+  rounds: 1000               # ADD Table 2: 1,000 communication rounds
   num_clients: 100
   client_fraction: 0.1
   eval_every: 5

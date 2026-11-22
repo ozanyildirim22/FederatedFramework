@@ -7,7 +7,7 @@ dataset lives on the training device as one ``uint8`` tensor (OrganAMNIST
 
 * **weak**   - random horizontal flip + random crop with reflect padding
                (``max(2, size // 8)`` pixels), as ``AugmentationFactory.weak``;
-* **strong** - weak + RandAugment + Cutout, as ``AugmentationFactory.strong``.
+* **strong** - weak + RandAugment (+ Cutout if ``data.cutout``), as ``AugmentationFactory.strong``.
   RandAugment uses torchvision's own op table and ``_apply_op`` (same operations
   and magnitudes). Each sample draws its own ops and signs, and samples that drew
   the same op are transformed together. Cutout follows ``RandomErasing(p=1,
@@ -38,8 +38,9 @@ def _reflect(idx: torch.Tensor, size: int) -> torch.Tensor:
 
 class GPUAugment:
     def __init__(self, image_size: int, mean: Sequence[float], std: Sequence[float],
-                 strong_aug: str = "randaugment", randaugment_n: int = 2, randaugment_m: int = 10,
-                 device: torch.device = torch.device("cpu")):
+                 strong_aug: str = "randaugment", randaugment_n: int = 1, randaugment_m: int = 10,
+                 device: torch.device = torch.device("cpu"), cutout: bool = False):
+        self.use_cutout = cutout
         if strong_aug not in ("randaugment", "none"):
             raise ValueError(f"Unknown strong_aug '{strong_aug}'")
         self.size, self.pad = image_size, max(2, image_size // 8)
@@ -124,7 +125,8 @@ class GPUAugment:
         x = self.weak(x)
         if self.strong_aug == "randaugment":
             x = self.randaugment(x)
-        return self.cutout(self.normalize(x))
+        x = self.normalize(x)
+        return self.cutout(x) if self.use_cutout else x
 
     def test_view(self, x: torch.Tensor) -> torch.Tensor:
         return self.normalize(x)

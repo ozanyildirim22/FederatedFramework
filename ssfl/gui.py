@@ -57,16 +57,20 @@ ALGO_INFO: Dict[str, Tuple[str, str, str, str]] = {
                   "FedAvg warm-up, then local, global and combined models average their predictions; "
                   "dynamic confidence threshold.", "ssl"),
     "fedlabel": ("FedLabel", "SSFL · ICCV 2023",
-                 "Per sample, the more confident of the local and global model gives the pseudo-label; "
-                 "plus global–local KL consistency.", "featured"),
+                 "Supervised local update, then a semi-supervised update from W_t: per sample, the more "
+                 "confident of the local and global model gives the pseudo-label; KL to the other model "
+                 "where both agree. Uploads Δw_L + Δw_U.", "featured"),
     "fixmatch": ("FixMatch", "SSL baseline · NeurIPS 2020",
                  "Weak-view pseudo-label above τ is enforced on the strong view.", "ssl"),
+    "uda": ("UDA", "SSL baseline · NeurIPS 2020",
+            "Sharpened weak-view prediction is the KL target for the strong view (FedLabel paper baseline).", "ssl"),
     "pseudolabel": ("Pseudo-Label", "SSL baseline · 2013",
                     "Hard pseudo-labels above a confidence threshold τ.", "ssl"),
     "supervised": ("Supervised", "Baseline",
                    "Same as FedAvg on labeled data; with 100% labels it is the upper bound.", "baseline"),
 }
-ALGO_ORDER = ["fedavg", "fedprox", "fedmatch", "fedtrinet", "fedlabel", "fixmatch", "pseudolabel", "supervised"]
+ALGO_ORDER = ["fedavg", "fedprox", "fedmatch", "fedtrinet", "fedlabel", "fixmatch", "uda", "pseudolabel",
+              "supervised"]
 
 #: preset file -> (icon, title, subtitle)
 PRESET_INFO = {
@@ -80,12 +84,20 @@ PRESET_INFO = {
 PARAM_HELP: Dict[str, Tuple[str, Optional[List[str]]]] = {
     "tau": ("Confidence threshold to keep a pseudo-label", None),
     "lambda_u": ("Weight of the unlabeled (pseudo-label) loss", None),
-    "lambda_kl": ("Weight of the global–local KL consistency", None),
-    "temperature": ("Softmax temperature of the KL term", None),
-    "confidence": ("Confidence score that decides local vs global", ["variance", "max_prob", "entropy"]),
+    "beta": ("β: confidence threshold to keep a pseudo-label", None),
+    "sup_steps": ("τ: SGD steps on labeled data (Step 1); empty = use sup_epochs", None),
+    "unsup_steps": ("τ′: SGD steps on unlabeled data (Steps 2–3); empty = use unsup_epochs", None),
+    "weight_by_used": ("Aggregation weight r_k = samples used this round (paper's Alg. 1)", None),
+    "threshold": ("UDA confidence mask: keep if top probability > threshold", None),
+    "lambda0": ("λ₀: scale of the global–local consistency weight", None),
+    "sup_epochs": ("τ: epochs on labeled data (Step 1); empty = local epochs", None),
+    "unsup_epochs": ("τ′: epochs on unlabeled data (Steps 2–3); empty = local epochs", None),
+    "kl_direction": ("add = KL(s(w_U) ‖ s̄) as in the ADD's Eq. 2; teacher = KL(s̄ ‖ s(w_U))",
+                     ["add", "teacher"]),
+    "confidence": ("h(·): variance of the logits (ADD), of the probabilities, max probability or exp(−entropy)",
+                   ["variance", "prob_variance", "max_prob", "entropy"]),
     "selection": ("Pseudo-label source: adaptive = FedLabel, local/global = ablations",
                   ["adaptive", "local", "global"]),
-    "local_warmup_steps": ("Supervised-only steps before pseudo-labeling starts", None),
     "mu": ("Proximal coefficient μ", None),
     "lambda_s": ("Weight of the supervised loss (on σ)", None),
     "lambda_iccs": ("Weight of the inter-client consistency (on ψ)", None),
@@ -110,10 +122,12 @@ PARAM_HELP: Dict[str, Tuple[str, Optional[List[str]]]] = {
 }
 
 METRIC_LABELS = {
-    "test_acc": "Test accuracy", "test_loss": "Test loss", "train_loss": "Train loss",
+    "test_acc": "Test accuracy", "test_f1": "Test macro F1", "test_precision": "Test macro precision",
+    "test_recall": "Test macro recall", "test_loss": "Test loss", "train_loss": "Train loss",
     "train_mask_rate": "Pseudo-label mask rate", "train_pl_acc": "Pseudo-label accuracy",
     "train_loss_sup": "Supervised loss", "train_loss_unsup": "Unlabeled loss",
-    "train_local_selected": "Local model chosen (FedLabel)", "train_threshold": "Threshold (FedTriNet)",
+    "train_local_selected": "Local model chosen (FedLabel)", "train_kl_rate": "KL applied (FedLabel)",
+    "train_lambda_k": "Mean λ_k (FedLabel)", "train_threshold": "Threshold (FedTriNet)",
     "time_s": "Seconds per round",
 }
 
@@ -159,7 +173,8 @@ FIELDS = [
     "name", "seed", "device", "output_dir",
     "data.dataset", "data.root", "data.image_size", "data.partitioner", "data.alpha",
     "data.labeled_ratio", "data.batch_size", "data.unlabeled_batch_ratio", "data.num_workers",
-    "data.strong_aug", "data.augment_device",
+    "data.strong_aug", "data.augment_device", "data.randaugment_n", "data.randaugment_m", "data.cutout",
+    "data.split",
     "model.name", "model.norm", "model.params",
     "strategy.local_epochs", "strategy.local_steps", "strategy.optimizer",
     "strategy.lr", "strategy.momentum", "strategy.weight_decay", "strategy.prox_mu",
@@ -169,7 +184,8 @@ FIELDS = [
 ]
 JSON_FIELDS = {"model.params", "server.params"}
 INT_FIELDS = {"seed", "data.image_size", "data.batch_size", "data.unlabeled_batch_ratio",
-              "data.num_workers", "strategy.local_epochs", "strategy.local_steps",
+              "data.num_workers", "data.randaugment_n", "data.randaugment_m",
+              "strategy.local_epochs", "strategy.local_steps",
               "server.rounds", "server.num_clients", "server.eval_every"}
 
 
@@ -237,7 +253,8 @@ def build_configs(vals: Sequence[Any], algos: Sequence[str], params_state: Dict[
         cfg = values_to_cfg(*vals, algorithm=algo, params=(params_state or {}).get(algo, {}))
         base = (cfg.name or "").strip()
         if not base:
-            cfg.name = f"{cfg.data.dataset}_{algo}_l{_ratio_tag(cfg.data.labeled_ratio)}"
+            cfg.name = (f"{cfg.data.dataset}_{algo}_l{_ratio_tag(cfg.data.labeled_ratio)}"
+                        f"_a{_ratio_tag(cfg.data.alpha)}")
         elif len(algos) > 1:
             cfg.name = f"{base}_{algo}"
         out.append(cfg)
@@ -533,7 +550,7 @@ PALETTE = ["#6366f1", "#ec4899", "#10b981", "#f59e0b", "#0ea5e9", "#8b5cf6", "#e
            "#84cc16", "#f97316", "#64748b", "#a855f7", "#06b6d4", "#e11d48", "#22c55e", "#eab308",
            "#3b82f6", "#d946ef", "#78716c", "#0d9488"]
 ALGO_COLORS = {"FedAvg": "#64748b", "FedProx": "#0ea5e9", "FedMatch": "#10b981", "FedTriNet": "#f59e0b",
-               "FedLabel": "#8b5cf6", "FixMatch": "#ec4899", "Pseudo-Label": "#14b8a6", "Supervised": "#78716c"}
+               "FedLabel": "#8b5cf6", "FixMatch": "#ec4899", "UDA": "#e11d48", "Pseudo-Label": "#14b8a6", "Supervised": "#78716c"}
 
 
 def color_map(df: pd.DataFrame, col: str) -> Dict[str, str]:
@@ -697,17 +714,28 @@ def _started_from_name(name: str) -> str:
     return f"{m[1]}-{m[2]}-{m[3]} {m[4]}:{m[5]}" if m else ""
 
 
+def _variant(algo: str, strat: Dict[str, Any], tag: Optional[str]) -> str:
+    """Row label in the Results tables. FixMatch / UDA read like the FedLabel paper's
+    baselines: FedAvg+FixMatch, or FedProx+FixMatch when the FedProx term was on."""
+    label = algo_label(algo)
+    if algo in ("fixmatch", "uda"):
+        label = ("FedProx+" if float(strat.get("prox_mu") or 0) > 0 else "FedAvg+") + label
+        if tag == "prox":
+            tag = None
+    return label + (f" ({tag})" if tag else "")
+
+
 def _run_meta(run_dir: Path) -> Dict[str, Any]:
     cfg = _read_yaml(run_dir / "config.yaml")
     summ = _read_json(run_dir / "summary.json")
     base = re.sub(RUN_STAMP, "", run_dir.name)
-    m = re.search(r"_l[0-9p]+_(.+)$", base)
+    m = re.search(r"_l[0-9p]+(?:_a[0-9p]+)?_(.+)$", base)
     algo = cfg.get("strategy", {}).get("name", "?")
     data, server, strat = cfg.get("data", {}), cfg.get("server", {}), cfg.get("strategy", {})
     return {"run": run_dir.name, "base": base, "dataset": data.get("dataset", "?"),
             "labels": data.get("labeled_ratio"), "alpha": data.get("alpha"),
             "clients": server.get("num_clients"), "fraction": server.get("client_fraction"),
-            "algorithm": algo, "variant": algo_label(algo) + (f" ({m.group(1)})" if m else ""),
+            "algorithm": algo, "variant": _variant(algo, strat, m.group(1) if m else None),
             "aggregator": server.get("aggregator"), "model": cfg.get("model", {}).get("name"),
             "planned_rounds": server.get("rounds"),
             "fast": data.get("augment_device") == "gpu" or strat.get("precision") in ("bf16", "fp16"),
@@ -754,6 +782,8 @@ def load_run(run_dir: Path) -> Optional[Dict[str, Any]]:
     acc = df["test_acc"].dropna() if "test_acc" in df else pd.Series(dtype=float)
     meta["best_acc"] = float(acc.max()) if len(acc) else None
     meta["final_acc"] = float(acc.iloc[-1]) if len(acc) else None
+    f1 = df["test_f1"].dropna() if "test_f1" in df else pd.Series(dtype=float)
+    meta["best_f1"] = float(f1.max()) if len(f1) else None
     last = df.iloc[-1] if len(df) else {}
     meta["mask"] = float(last["train_mask_rate"]) if "train_mask_rate" in df and last["train_mask_rate"] == last["train_mask_rate"] else None
     meta["pl_acc"] = float(df["train_pl_acc"].dropna().iloc[-1]) if "train_pl_acc" in df and df["train_pl_acc"].notna().any() else None
@@ -772,7 +802,7 @@ def _pct(v) -> str:
 
 def leaderboard(runs: List[Dict[str, Any]]) -> pd.DataFrame:
     cols = ["#", "run", "started", "dataset", "labels", "α", "clients", "algorithm", "best acc",
-            "final acc", "rounds", "time", "s/round", "status"]
+            "final acc", "best F1", "rounds", "time", "s/round", "status"]
     if not runs:
         return pd.DataFrame(columns=cols)
     df = pd.DataFrame(runs).sort_values("best_acc", ascending=False, na_position="last", kind="mergesort")
@@ -783,6 +813,7 @@ def leaderboard(runs: List[Dict[str, Any]]) -> pd.DataFrame:
         "clients": [f"{n}×{c:g}" if n and c else (str(n) if n else "") for n, c in zip(df["clients"], df["fraction"])],
         "algorithm": df["variant"] + df["fast"].map(lambda f: " ⚡" if f else ""),
         "best acc": df["best_acc"].map(_pct), "final acc": df["final_acc"].map(_pct),
+        "best F1": df["best_f1"].map(_pct) if "best_f1" in df else "—",
         "rounds": [f"{r}/{p}" if p else str(r) for r, p in zip(df["rounds"], df["planned_rounds"])],
         "time": df["time_s"].map(lambda v: _fmt_secs(v) if v is not None and v == v else "—"),
         "s/round": df["round_s"].map(lambda v: f"{v:.1f}" if v is not None and v == v else "—"),
@@ -858,7 +889,10 @@ def render_run_details(meta: Dict[str, Any], run_dir: Path) -> str:
                            ("partitioner", data.get("partitioner")), ("Dirichlet α", data.get("alpha")),
                            ("image size", data.get("image_size")), ("labeled batch", data.get("batch_size")),
                            ("unlabeled ratio μ", data.get("unlabeled_batch_ratio")),
-                           ("strong augmentation", data.get("strong_aug")),
+                           ("strong augmentation", f"{data.get('strong_aug')} (N={data.get('randaugment_n', 2)}, "
+                                                   f"M={data.get('randaugment_m', 10)}"
+                                                   f"{', + Cutout' if data.get('cutout', 'randaugment_n' not in data) else ''})"),
+                           ("labeled split", data.get("split", "stratified")),
                            ("augmentation on", data.get("augment_device", "cpu")),
                            ("DataLoader workers", summ.get("num_workers", data.get("num_workers")))])),
         ("🌐 Federation", _rows([("clients N", server.get("num_clients")), ("clients per round C", server.get("client_fraction")),
@@ -933,9 +967,17 @@ def detail_frames(run_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
     return acc, loss
 
 
-def thesis_table(runs: List[Dict[str, Any]]) -> pd.DataFrame:
-    """Rows = algorithm (variant), columns = dataset @ label ratio, cells = best test accuracy (%).
-    Only finished runs count; for repeated runs of the same name the most recent one is used."""
+THESIS_VALUES = {"acc": "Best test accuracy (%)", "f1": "Best macro F1 (%)",
+                 "ratio": "Relative accuracy ratio (method / FedAvg, same setting)"}
+
+
+def thesis_table(runs: List[Dict[str, Any]], value: str = "acc") -> pd.DataFrame:
+    """Rows = algorithm (variant), columns = dataset · labels · α.
+
+    ``value``: ``acc`` best test accuracy (%), ``f1`` best macro F1 (%), ``ratio`` best
+    accuracy divided by FedAvg's best accuracy in the same column (the ADD's Eq. 7; FedAvg
+    trained on the same labeled data, i.e. the low baseline). Only finished runs count; for
+    repeated runs of the same name the most recent one is used."""
     rows = [r for r in runs if r["best_acc"] is not None and r["finished"]]
     if not rows:
         return pd.DataFrame()
@@ -943,13 +985,29 @@ def thesis_table(runs: List[Dict[str, Any]]) -> pd.DataFrame:
     for r in sorted(rows, key=lambda r: r["mtime"]):
         latest[r["base"]] = r
     df = pd.DataFrame(latest.values())
-    df["setting"] = df.apply(lambda r: f"{r['dataset']} {100 * r['labels']:g}%" if r["labels"] is not None
-                             else r["dataset"], axis=1)
-    piv = df.pivot_table(index="variant", columns="setting", values="best_acc", aggfunc="max") * 100
+
+    def setting(r):
+        out = r["dataset"]
+        if r["labels"] is not None and r["labels"] == r["labels"]:
+            out += f" {100 * r['labels']:g}%"
+        if r.get("alpha") is not None and r["alpha"] == r["alpha"]:
+            out += f" α{r['alpha']:g}"
+        return out
+
+    df["setting"] = df.apply(setting, axis=1)
+    col = "best_f1" if value == "f1" else "best_acc"
+    if col not in df:
+        return pd.DataFrame()
+    piv = df.pivot_table(index="variant", columns="setting", values=col, aggfunc="max")
+    if value == "ratio":
+        base = piv.loc["FedAvg"] if "FedAvg" in piv.index else None
+        piv = piv / base if base is not None else piv * float("nan")
+    else:
+        piv = piv * 100
     order = [algo_label(a) for a in ALGO_ORDER]
     piv = piv.reindex(sorted(piv.index, key=lambda v: (order.index(v.split(" (")[0])
                                                        if v.split(" (")[0] in order else 99, v)))
-    piv = piv.round(2).reset_index().rename(columns={"variant": "algorithm"})
+    piv = piv.round(3 if value == "ratio" else 2).reset_index().rename(columns={"variant": "algorithm"})
     piv.columns.name = None
     return piv
 
@@ -962,7 +1020,7 @@ def _tex(text: str) -> str:
     return out
 
 
-def to_latex(table: pd.DataFrame, caption: str = "Best test accuracy (%)") -> str:
+def to_latex(table: pd.DataFrame, caption: str = "Best test accuracy (%)", digits: int = 2) -> str:
     if table is None or not len(table):
         return "% no results yet\n"
     cols = list(table.columns)
@@ -979,7 +1037,7 @@ def to_latex(table: pd.DataFrame, caption: str = "Best test accuracy (%)") -> st
             if v != v:
                 cells.append("--")
             else:
-                s = f"{v:.2f}"
+                s = f"{v:.{digits}f}"
                 cells.append(f"\\textbf{{{s}}}" if v == best[c] else s)
         lines.append(" & ".join(cells) + r" \\")
     lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
@@ -1363,6 +1421,15 @@ def build_app():
                                                              label="Augmentation on",
                                                              info="gpu: dataset kept on the GPU, batched")
                                 root = gr.Textbox(v["data.root"], label="Download folder")
+                            with gr.Row():
+                                ra_n = gr.Number(v["data.randaugment_n"], precision=0, label="RandAugment N",
+                                                 info="ops per image (ADD: 1)")
+                                ra_m = gr.Number(v["data.randaugment_m"], precision=0, label="RandAugment M",
+                                                 info="magnitude (ADD: 10)")
+                                cutout = gr.Checkbox(v["data.cutout"], label="Cutout",
+                                                     info="extra erasing on the strong view (not in the ADD)")
+                                split = gr.Dropdown(["random", "stratified"], value=v["data.split"],
+                                                    label="Labeled split", info="random = ADD")
                         with gr.Accordion("🧠  Model & local training", open=False):
                             with gr.Row():
                                 model_name = gr.Dropdown(MODELS.names(), value=v["model.name"], label="Model")
@@ -1519,9 +1586,12 @@ def build_app():
                         curve_plot = gr.LinePlot(_typed([]), x="round",
                                                  y="value", color="run", height=380)
                     with gr.Tab("🎓  Thesis table", id="thesis"):
-                        gr.Markdown("Best test accuracy (%) per algorithm and setting, from finished runs "
-                                    "(latest run of each name). Bold in LaTeX = best in column; the "
-                                    "table uses the `booktabs` package.")
+                        gr.Markdown("One row per algorithm, one column per dataset · labels · α, from finished "
+                                    "runs (latest run of each name). The ratio divides by FedAvg's best "
+                                    "accuracy in the same column (ADD Eq. 7). Bold in LaTeX = best in "
+                                    "column; the table uses the `booktabs` package.")
+                        thesis_value = gr.Radio([(lab, k) for k, lab in THESIS_VALUES.items()], value="acc",
+                                                label="Value")
                         thesis = gr.Dataframe(pd.DataFrame(), wrap=True)
                         with gr.Row():
                             dl_csv = gr.DownloadButton("⬇  Leaderboard CSV", value=None)
@@ -1535,7 +1605,7 @@ def build_app():
         # ============================================================ wiring
         components = [name, seed, device, output_dir,
                       dataset, root, image_size, partitioner, alpha, labeled_ratio, batch_size,
-                      unl_ratio, num_workers, strong_aug, augment_device,
+                      unl_ratio, num_workers, strong_aug, augment_device, ra_n, ra_m, cutout, split,
                       model_name, norm, model_params,
                       local_epochs, local_steps, optimizer, lr, momentum, weight_decay,
                       prox_mu, grad_clip, precision, channels_last,
@@ -1847,19 +1917,19 @@ def build_app():
             yield from stream(grid_view, "grid")
 
         # ------------------------------------------------------------ results
-        def on_results(d, ds_filter, algo_filter, metric_key, keep_selection=None):
+        def on_results(d, ds_filter, algo_filter, metric_key, value_key="acc", keep_selection=None):
             runs = scan_runs(d)
             datasets = sorted({r["dataset"] for r in runs})
             algos_found = sorted({r["variant"] for r in runs})
             sel = [r for r in runs if (not ds_filter or r["dataset"] in ds_filter)
                    and (not algo_filter or r["variant"] in algo_filter)]
             board_df = leaderboard(sel)
-            thesis_df = thesis_table(sel)
+            thesis_df = thesis_table(sel, value_key)
             tmp = Path(tempfile.gettempdir()) / "ssfl_studio"
             tmp.mkdir(exist_ok=True)
             csv_path, tex_path = tmp / "leaderboard.csv", tmp / "thesis_table.tex"
             board_df.to_csv(csv_path, index=False)
-            latex = to_latex(thesis_df)
+            latex = to_latex(thesis_df, THESIS_VALUES[value_key], digits=3 if value_key == "ratio" else 2)
             tex_path.write_text(latex, encoding="utf-8")
             names = [r["run"] for r in sel]
             ranked = [r["run"] for r in sorted(sel, key=lambda r: -(r["best_acc"] or 0))]
@@ -1879,7 +1949,7 @@ def build_app():
                                                                  y_title=METRIC_LABELS.get(metric_key, metric_key)),
                     board_order(sel), gr.update(choices=run_choices(sel)))
 
-        res_inputs = [runs_dir, f_dataset, f_algo, metric]
+        res_inputs = [runs_dir, f_dataset, f_algo, metric, thesis_value]
         res_outputs = [f_dataset, f_algo, run_select, board, thesis, dl_csv, dl_tex, latex_view, res_kpis,
                        curve_plot, board_runs, detail_pick]
 
@@ -1932,6 +2002,7 @@ def build_app():
         refresh_btn.click(on_results, res_inputs, res_outputs)
         f_dataset.input(on_results, res_inputs, res_outputs)
         f_algo.input(on_results, res_inputs, res_outputs)
+        thesis_value.input(on_results, res_inputs, res_outputs)
         def on_curves(d, names, m):
             return plot_update(run_curves(d, names, m), y_title=METRIC_LABELS.get(m, m))
 
@@ -1947,6 +2018,10 @@ def build_app():
     return app
 
 
+#: Optional integer parameters (default None): shown as number fields, empty = default.
+INT_PARAMS = {"sup_epochs", "unsup_epochs", "sup_steps", "unsup_steps"}
+
+
 def _display_value(kind: type, value: Any) -> Any:
     if kind in (bool, int, float, str):
         return value
@@ -1957,7 +2032,7 @@ def _param_field(gr, key: str, value: Any, default: Any):
     """One form field for an algorithm parameter. Returns ``(component, kind)``."""
     help_text, choices = PARAM_HELP.get(key, ("", None))
     info = help_text + (f" (default {default})" if default is not None and not isinstance(default, bool) else "")
-    kind = type(default if default is not None else value)
+    kind = int if key in INT_PARAMS else type(default if default is not None else value)
     if choices:
         comp = gr.Dropdown(choices, value=value, label=key, info=info, min_width=200)
     elif kind is bool:

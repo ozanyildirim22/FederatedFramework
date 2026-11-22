@@ -1,13 +1,24 @@
-# Full thesis grid: every dataset x label ratio x algorithm.
+# Full thesis grid, as planned in the ADD (Sections 3.3 and 5.1) with the baselines of the FedLabel
+# paper (Cho et al., ICCV 2023, Tables 3-4):
+#   datasets x labeled ratio x Dirichlet alpha (0.1 and 1.0) x algorithm, 1,000 rounds (the presets);
+#   FedAvg / FedProx, FedAvg+FixMatch, FedAvg+UDA, FedProx+FixMatch, FedProx+UDA, FedTriNet, FedMatch, FedLabel;
+#   FedAvg (100%) and FedProx (100%) as upper bounds; FedLabel ablations on lambda_0, tau, beta, selection, h(.).
 #   python -m ssfl --grid configs/grids/thesis.yaml --dry-run
 #   python -m ssfl --grid configs/grids/thesis.yaml --only organamnist
-# Finished runs (runs/<name>_*/summary.json) are skipped, so the grid can be resumed.
+# Finished runs (summary.json with status "finished") are skipped, so the grid can be resumed.
 # Extra --set overrides apply to every run, e.g. --set output_dir=/content/drive/MyDrive/ssfl/runs
 
 algorithms:
-  fedavg: {}                         # labeled data only
+  fedavg: {}                         # labeled data only (the ADD's low baseline)
   fedprox:
     mu: 0.01
+  fixmatch:                          # FedAvg+FixMatch (FedProx+FixMatch: the "prox" experiments below)
+    tau: 0.95
+    lambda_u: 1.0
+  uda:                               # FedAvg+UDA (FedProx+UDA: the "prox" experiments below)
+    lambda_u: 1.0
+    temperature: 0.4
+    threshold: 0.8
   fedmatch:
     tau: 0.85
     lambda_s: 10.0
@@ -17,44 +28,77 @@ algorithms:
     num_helpers: 2
     helper_every: 10
   fedtrinet:
-    pretrain_rounds: 20
+    pretrain_rounds: 200              # FedAvg warm-up phase (20% of the 1,000 rounds)
     alpha: 0.93
     lambda_u: 1.0
     finetune_steps: 5
-  fedlabel:
-    tau: 0.95
+  fedlabel:                           # ADD Section 3.1 / Algorithm 2
+    beta: 0.95
+    lambda0: 1.0
     lambda_u: 1.0
-    lambda_kl: 1.0
-    temperature: 1.0
+    sup_epochs: 1
+    unsup_epochs: 1
     confidence: variance
     selection: adaptive
-    local_warmup_steps: 5
+    kl_direction: add
 
 experiments:
-  # Cross-device: 100 clients, C = 0.1, 200 rounds
+  # Cross-device: CIFAR-10, ResNet-34, 100 clients, C = 0.1
   - config: configs/cifar10_fedlabel.yaml
     labeled_ratio: [0.2, 0.5]
-    algorithm_params:
-      fedtrinet: {pretrain_rounds: 40}
-  # Cross-silo: 10 clients, C = 1.0, 100 rounds
+    alpha: [0.1, 1.0]
+  # Cross-silo: OrganAMNIST / PathMNIST, ResNet-18, 10 clients, C = 1.0
   - config: configs/organamnist_fedlabel.yaml
     labeled_ratio: [0.05, 0.2]
+    alpha: [0.1, 1.0]
   - config: configs/pathmnist_fedlabel.yaml
     labeled_ratio: [0.05, 0.2]
+    alpha: [0.1, 1.0]
 
-  # FedLabel ablations (OrganAMNIST, 5% labels)
+  # FedProx + FixMatch / UDA (the FedLabel paper's baselines): same runs with the FedProx term
+  - {config: configs/cifar10_fedlabel.yaml, labeled_ratio: [0.2, 0.5], alpha: [0.1, 1.0],
+     algorithms: [fixmatch, uda], tag: prox, overrides: {strategy.prox_mu: 0.01}}
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05, 0.2], alpha: [0.1, 1.0],
+     algorithms: [fixmatch, uda], tag: prox, overrides: {strategy.prox_mu: 0.01}}
+  - {config: configs/pathmnist_fedlabel.yaml, labeled_ratio: [0.05, 0.2], alpha: [0.1, 1.0],
+     algorithms: [fixmatch, uda], tag: prox, overrides: {strategy.prox_mu: 0.01}}
+
+  # High baselines (ADD Table 2 / paper "100%"): FedAvg and FedProx with 100% labels
+  - config: configs/cifar10_fedlabel.yaml
+    labeled_ratio: [1.0]
+    alpha: [0.1, 1.0]
+    algorithms: [fedavg, fedprox]
   - config: configs/organamnist_fedlabel.yaml
-    labeled_ratio: [0.05]
-    tag: sel_local
-    algorithms: [fedlabel]
-    algorithm_params: {fedlabel: {selection: local}}
-  - config: configs/organamnist_fedlabel.yaml
-    labeled_ratio: [0.05]
-    tag: sel_global
-    algorithms: [fedlabel]
-    algorithm_params: {fedlabel: {selection: global}}
-  - config: configs/organamnist_fedlabel.yaml
-    labeled_ratio: [0.05]
-    tag: conf_maxprob
-    algorithms: [fedlabel]
-    algorithm_params: {fedlabel: {confidence: max_prob}}
+    labeled_ratio: [1.0]
+    alpha: [0.1, 1.0]
+    algorithms: [fedavg, fedprox]
+  - config: configs/pathmnist_fedlabel.yaml
+    labeled_ratio: [1.0]
+    alpha: [0.1, 1.0]
+    algorithms: [fedavg, fedprox]
+
+  # FedLabel ablations (ADD Section 5.1): OrganAMNIST, 5% labels, alpha = 0.1
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel],
+     tag: lambda0_0, algorithm_params: {fedlabel: {lambda0: 0.0}}}
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel],
+     tag: lambda0_0p5, algorithm_params: {fedlabel: {lambda0: 0.5}}}
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel],
+     tag: lambda0_2, algorithm_params: {fedlabel: {lambda0: 2.0}}}
+  # tau in local SGD steps, as in the paper's ablation (tau = 5 was the worst there)
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel],
+     tag: tau_5, algorithm_params: {fedlabel: {sup_steps: 5}}}
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel],
+     tag: tau_20, algorithm_params: {fedlabel: {sup_steps: 20}}}
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel],
+     tag: tau_50, algorithm_params: {fedlabel: {sup_steps: 50}}}
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel],
+     tag: beta_0p8, algorithm_params: {fedlabel: {beta: 0.8}}}
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel],
+     tag: beta_0p9, algorithm_params: {fedlabel: {beta: 0.9}}}
+  # model-selection ablations: always local / always global, and max-probability confidence
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel],
+     tag: sel_local, algorithm_params: {fedlabel: {selection: local}}}
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel],
+     tag: sel_global, algorithm_params: {fedlabel: {selection: global}}}
+  - {config: configs/organamnist_fedlabel.yaml, labeled_ratio: [0.05], alpha: [0.1], algorithms: [fedlabel],
+     tag: conf_maxprob, algorithm_params: {fedlabel: {confidence: max_prob}}}

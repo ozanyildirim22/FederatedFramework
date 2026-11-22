@@ -55,8 +55,21 @@ def dirichlet_partition(labels: np.ndarray, num_clients: int, rng: np.random.Gen
 
 
 def split_labeled_unlabeled(indices: np.ndarray, labels: np.ndarray, labeled_ratio: float,
-                            rng: np.random.Generator):
-    """Stratified per-client split into labeled / unlabeled index sets."""
+                            rng: np.random.Generator, mode: str = "stratified"):
+    """Per-client split into labeled / unlabeled index sets.
+
+    * ``random``     - a uniform random ``labeled_ratio`` of the client's samples (the ADD);
+                       a class can, by chance, end up with no labels on a client.
+    * ``stratified`` - the same fraction of every class.
+    """
+    if mode == "random":
+        perm = rng.permutation(indices)
+        k = int(round(labeled_ratio * len(perm)))
+        if k == 0 and len(perm) > 0 and labeled_ratio > 0:            # guarantee >= 1 label
+            k = 1
+        return np.sort(perm[:k]), np.sort(perm[k:])
+    if mode != "stratified":
+        raise ValueError(f"Unknown split '{mode}' (random | stratified)")
     labeled, unlabeled = [], []
     for c in np.unique(labels[indices]):
         idx_c = rng.permutation(indices[labels[indices] == c])

@@ -24,8 +24,10 @@ class DataConfig:
     num_workers: int = -1               # DataLoader workers; -1 = auto (0 on Windows / small rounds)
     strong_aug: str = "randaugment"     # randaugment | none
     augment_device: str = "cpu"         # cpu (PIL, exact) | gpu (dataset on the GPU, batched augmentation)
-    randaugment_n: int = 2
-    randaugment_m: int = 10
+    randaugment_n: int = 1              # RandAugment ops per image (ADD: N = 1)
+    randaugment_m: int = 10             # RandAugment magnitude (ADD: 10)
+    cutout: bool = False                # add Cutout (RandomErasing) to the strong view (not in the ADD)
+    split: str = "random"               # labeled/unlabeled split per client: random (ADD) | stratified
 
 
 @dataclass

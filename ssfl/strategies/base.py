@@ -79,6 +79,7 @@ class Strategy:
         self.step: int = 0           # current local step within the round
         self.total_steps: int = 0    # local steps in the current round
         self._channels_last = False
+        self.aggregation_weight: Optional[float] = None   # set by strategies that define r_k
 
     # ---------------------------------------------------------- server hooks
     # Some algorithms (FedMatch, FedTriNet) have a server-side part. In the
@@ -160,7 +161,9 @@ class Strategy:
             return "fp32"            # e.g. T4: bf16 would only be emulated (slower than fp32)
         return p
 
-    def local_train(self, model: nn.Module, client, device: torch.device) -> Dict[str, float]:
+    # -------------------------------------------------------- loop pieces
+    def prepare(self, model: nn.Module, device: torch.device) -> None:
+        """Device / memory format, frozen copy of W_t and the FedProx anchor."""
         self.device = device
         self._channels_last = bool(getattr(self.cfg, "channels_last", False)) and device.type == "cuda"
         if self._channels_last:
@@ -172,30 +175,27 @@ class Strategy:
         if self.prox_mu > 0:
             self._global_params = [p.detach().clone() for p in model.parameters()]
 
-        self.on_round_start(model, client)
+    def optimize(self, model: nn.Module, steps: int, lab_it, unl_it, loss_fn=None,
+                 sums: Optional[Dict[str, object]] = None) -> Dict[str, object]:
+        """``steps`` SGD steps of ``loss_fn(model, labeled, unlabeled)`` (default
+        ``compute_loss``) with a fresh optimiser. Handles precision, the FedProx term
+        and gradient clipping. Logged values are summed into ``sums`` on the device:
+        a float() per value per step would make the CPU wait for the GPU every step."""
+        loss_fn = loss_fn or self.compute_loss
         model.train()
         opt = self.make_optimizer(model)
-        steps = self.num_steps(client)
-        self.total_steps = steps
-        lab_it = round_batches(client.data.labeled, steps) if client.data.labeled is not None else None
-        unl_it = (round_batches(client.data.unlabeled, steps)
-                  if self.uses_unlabeled and client.data.unlabeled is not None else None)
-
         # bf16 has the float32 range, so it needs no loss scaling; fp16 does
-        prec = self.precision(device)
+        prec = self.precision(self.device)
         use_amp = prec != "fp32"
         amp_dtype = torch.bfloat16 if prec == "bf16" else torch.float16
         scaler = torch.amp.GradScaler("cuda", enabled=prec == "fp16")
-
-        # logged values stay on the device during the round (a float() per value per
-        # step would make the CPU wait for the GPU every step); converted once at the end
-        sums: Dict[str, object] = defaultdict(float)
+        sums = sums if sums is not None else defaultdict(float)
         for step in range(steps):
             self.step = step
             labeled = self._to_device(next(lab_it)) if lab_it else None
             unlabeled = self._to_device(next(unl_it)) if unl_it else None
-            with torch.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
-                loss, logs = self.compute_loss(model, labeled, unlabeled)
+            with torch.autocast(self.device.type, dtype=amp_dtype, enabled=use_amp):
+                loss, logs = loss_fn(model, labeled, unlabeled)
             prox = self.proximal_term(model)
             if prox is not None:
                 loss = loss + prox
@@ -209,12 +209,33 @@ class Strategy:
             scaler.update()
             for k, v in logs.items():
                 sums[k] = sums[k] + (v.detach().float() if torch.is_tensor(v) else v)
+        return sums
 
-        self.on_round_end(model, client)
-        self.global_model, self._global_params = None, None
+    @staticmethod
+    def summarize(sums: Dict[str, object], steps: Dict[str, int] | int) -> Dict[str, float]:
+        """Per-step means of the summed logs (``steps`` may map a key prefix to its own
+        step count, e.g. for two-phase strategies); ``_pl_correct / _pl_count`` become
+        ``pl_acc``: the accuracy over all pseudo-labeled samples of the round."""
         out = {k: float(v) for k, v in sums.items()}
         correct, count = out.pop("_pl_correct", None), out.pop("_pl_count", None)
-        metrics = {k: v / steps for k, v in out.items()}
-        if count:                                     # accuracy over all pseudo-labeled samples
+        metrics = {}
+        for k, v in out.items():
+            n = steps if isinstance(steps, int) else next(
+                (s for p, s in steps.items() if k.startswith(p)), steps.get("", 1))
+            metrics[k] = v / max(1, n)
+        if count:
             metrics["pl_acc"] = correct / count
         return metrics
+
+    def local_train(self, model: nn.Module, client, device: torch.device) -> Dict[str, float]:
+        self.prepare(model, device)
+        self.on_round_start(model, client)
+        steps = self.num_steps(client)
+        self.total_steps = steps
+        lab_it = round_batches(client.data.labeled, steps) if client.data.labeled is not None else None
+        unl_it = (round_batches(client.data.unlabeled, steps)
+                  if self.uses_unlabeled and client.data.unlabeled is not None else None)
+        sums = self.optimize(model, steps, lab_it, unl_it)
+        self.on_round_end(model, client)
+        self.global_model, self._global_params = None, None
+        return self.summarize(sums, steps)
