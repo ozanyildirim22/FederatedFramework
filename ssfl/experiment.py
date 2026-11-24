@@ -52,6 +52,10 @@ class Experiment:
         self.verbose = verbose
         set_seed(cfg.seed)
         self.device = resolve_device(cfg.device)
+        if self.device.type == "cuda":
+            # tries the conv algorithms once per new input shape and keeps the fastest;
+            # same results up to floating-point rounding
+            torch.backends.cudnn.benchmark = bool(cfg.strategy.cudnn_benchmark)
 
         # Tier 1 - data
         self.data = DataManager(cfg.data, cfg.server.num_clients, seed=cfg.seed)

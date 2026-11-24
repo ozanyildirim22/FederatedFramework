@@ -29,6 +29,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -38,6 +39,7 @@ import yaml
 from .config import ExperimentConfig
 from .runinfo import code_version, default_params  # noqa: F401 - re-exported for plug-ins / tests
 from .registry import AGGREGATORS, DATASETS, MODELS, PARTITIONERS, STRATEGIES
+from .strategies.base import COMPILE_MODES, compile_mode
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = PROJECT_ROOT / "configs"
@@ -178,7 +180,8 @@ FIELDS = [
     "model.name", "model.norm", "model.params",
     "strategy.local_epochs", "strategy.local_steps", "strategy.optimizer",
     "strategy.lr", "strategy.momentum", "strategy.weight_decay", "strategy.prox_mu",
-    "strategy.grad_clip", "strategy.precision", "strategy.channels_last",
+    "strategy.grad_clip", "strategy.precision", "strategy.channels_last", "strategy.cudnn_benchmark",
+    "strategy.compile",
     "server.aggregator", "server.rounds", "server.num_clients", "server.client_fraction",
     "server.eval_every", "server.params",
 ]
@@ -219,6 +222,8 @@ def cfg_to_values(cfg: ExperimentConfig) -> List[Any]:
             v = v or 0.0
         elif key == "data.hflip":
             v = HFLIP_CHOICES.get(v, "auto")
+        elif key == "strategy.compile":
+            v = compile_mode(SimpleNamespace(compile=v)) or "none"
         vals.append(v)
     return vals
 
@@ -240,6 +245,8 @@ def values_to_cfg(*vals, algorithm: str = "fedlabel", params: Optional[Dict[str,
             v = None
         if key == "data.hflip":
             v = {"on": True, "off": False}.get(v)
+        if key == "strategy.compile" and v in (None, "", "none"):
+            v = None
         _set(raw, key, v)
     raw["strategy"]["name"] = algorithm
     raw["strategy"]["params"] = copy.deepcopy(params or {})
@@ -307,6 +314,94 @@ def system_info() -> Dict[str, str]:
 # --------------------------------------------------------------- runner
 class _Stopped(Exception):
     pass
+
+
+class SpeedCheck:
+    """The Experiment tab's speed check (:func:`ssfl.bench.bench_config`) in a background
+    thread. It shares the GPU with training, so it and the RunController never run together."""
+
+    ROUNDS = 3                                     # timed rounds per setting (after 2 warm-up rounds)
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.thread: Optional[threading.Thread] = None
+        self.stop_event = threading.Event()
+        self.rows: List[Dict[str, Any]] = []
+        self.name, self.total_rounds, self.error, self.version = "", 0, None, 0
+
+    @property
+    def running(self) -> bool:
+        return self.thread is not None and self.thread.is_alive()
+
+    def start(self, cfg: ExperimentConfig) -> None:
+        from .bench import SETTINGS
+        with self.lock:
+            self.rows = [{"setting": label, "status": "queued"} for label, _ in SETTINGS]
+            self.name, self.total_rounds, self.error = cfg.name, cfg.server.rounds, None
+            self.version += 1
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self._work, args=(cfg,), daemon=True)
+        self.thread.start()
+
+    def stop(self) -> bool:
+        if not self.running:
+            return False
+        self.stop_event.set()
+        return True
+
+    def _set(self, rows) -> None:
+        with self.lock:
+            self.rows, self.version = rows, self.version + 1
+
+    def _work(self, cfg: ExperimentConfig) -> None:
+        from .bench import bench_config
+        try:
+            bench_config(cfg, self.ROUNDS, on_update=self._set, should_stop=self.stop_event.is_set)
+        except Exception as e:  # noqa: BLE001 - e.g. the dataset failed to load
+            with self.lock:
+                self.error, self.version = f"{type(e).__name__}: {e}", self.version + 1
+
+    def table(self) -> pd.DataFrame:
+        with self.lock:
+            rows, total = [dict(r) for r in self.rows], self.total_rounds
+        out = []
+        for r in rows:
+            ok = r["status"] == "ok"
+            out.append({
+                "setting": r["setting"],
+                "status": {"running": "⏳ running", "ok": "✅ done", "failed": "❌ failed",
+                           "skipped": "⏭ skipped"}.get(r["status"], r["status"]),
+                "s / round": f"{r['s_per_round']:.2f}" if ok else "",
+                "s / client": f"{r['client_s']:.2f}" if ok else "",
+                f"time for {total} rounds": _fmt_secs(r["s_per_round"] * total) if ok else "",
+                "speed-up": f"{r['speedup']:.2f}×" if ok and r.get("speedup") else "",
+                "warm-up": _fmt_secs(r["warmup_s"]) if ok else "",
+                "note": r.get("error", ""),
+            })
+        return pd.DataFrame(out)
+
+    def summary(self) -> str:
+        with self.lock:
+            rows, name, error = [dict(r) for r in self.rows], self.name, self.error
+        if error:
+            return f'<div class="algo-info empty">⚠️ Speed check failed: {html.escape(error)}</div>'
+        ok = [r for r in rows if r["status"] == "ok"]
+        if self.running:
+            cur = next((r["setting"] for r in rows if r["status"] == "running"), "…")
+            return (f'<div class="algo-info empty">⏳ Timing <b>{html.escape(name)}</b>: '
+                    f'{len([r for r in rows if r["status"] in ("ok", "failed")])}/{len(rows)} settings done, '
+                    f'now <b>{html.escape(cur)}</b>. Each setting builds the run, trains 2 warm-up rounds '
+                    f'and {self.ROUNDS} timed rounds; the compile settings compile in the first round.</div>')
+        if not ok:
+            return '<div class="algo-info empty">No setting finished.</div>'
+        best = min(ok, key=lambda r: r["s_per_round"])
+        if best["setting"] == "baseline" or (best.get("speedup") or 0) < 1.05:
+            return (f'<div class="algo-info">For <b>{html.escape(name)}</b> no option is clearly faster than '
+                    f'the baseline (within 5%): keep the settings as they are.</div>')
+        return (f'<div class="algo-info">Fastest for <b>{html.escape(name)}</b>: '
+                f'<b>{html.escape(best["setting"])}</b> — {best["speedup"]:.2f}× the baseline. Set it under '
+                f'<i>Model &amp; local training</i> (cuDNN benchmark, channels_last, torch.compile) '
+                f'before you launch.</div>')
 
 
 class RunController:
@@ -936,7 +1031,9 @@ def render_run_details(meta: Dict[str, Any], run_dir: Path) -> str:
                                      ("local work", lr), ("grad clip", strat.get("grad_clip")),
                                      ("extra FedProx μ", strat.get("prox_mu")),
                                      ("precision", summ.get("precision", strat.get("precision", "fp32"))),
-                                     ("channels_last", strat.get("channels_last", False))])),
+                                     ("channels_last", strat.get("channels_last", False)),
+                                     ("cuDNN benchmark", strat.get("cudnn_benchmark", False)),
+                                     ("torch.compile", strat.get("compile") or "off")])),
         (f"🎛️ {html.escape(algo_label(meta['algorithm']))} parameters",
          _param_rows(STRATEGIES.get(meta["algorithm"]) if meta["algorithm"] in STRATEGIES else None,
                      strat.get("params", {}))),
@@ -1367,7 +1464,7 @@ footer { display:none !important; }
 """
 
 
-FAST_MODE = {"data.augment_device": "gpu", "strategy.precision": "bf16"}
+FAST_MODE = {"data.augment_device": "gpu", "strategy.precision": "bf16", "strategy.cudnn_benchmark": True}
 
 
 def _is_fast(values: Dict[str, Any]) -> bool:
@@ -1400,6 +1497,7 @@ def build_app():
     import gradio as gr
 
     ctrl = RunController()
+    speed = SpeedCheck()
     presets = list_presets()
     start_preset = "organamnist_fedlabel.yaml" if "organamnist_fedlabel.yaml" in presets else (
         presets[0] if presets else None)
@@ -1445,7 +1543,7 @@ def build_app():
                                                             step=0.01, label="Clients per round C")
                             fast = gr.Checkbox(
                                 _is_fast(v), label="⚡ Fast GPU mode",
-                                info="Augmentation on the GPU + bf16 precision, for large GPUs (A100 / H100 / "
+                                info="Augmentation on the GPU + bf16 precision + cuDNN benchmark, for large GPUs (A100 / H100 / "
                                      "RTX PRO class), where CPU augmentation is the bottleneck. On small GPUs "
                                      "(T4, laptops) it gains little. Same augmentations, but not bit-identical "
                                      "to the CPU pipeline: keep it off to reproduce earlier runs.")
@@ -1542,6 +1640,12 @@ def build_app():
                                                         info="bf16: faster on modern GPUs, no loss scaling")
                                 channels_last = gr.Checkbox(v["strategy.channels_last"], label="channels_last",
                                                             info="NHWC memory layout for convolutions")
+                                cudnn_benchmark = gr.Checkbox(v["strategy.cudnn_benchmark"], label="cuDNN benchmark",
+                                                              info="fastest conv kernels per input shape")
+                                compile_ = gr.Dropdown(["none", *COMPILE_MODES], value=v["strategy.compile"],
+                                                       label="torch.compile",
+                                                       info="fewer GPU kernel launches; needs Triton (Colab / "
+                                                            "Linux). Check with --bench first")
                             model_params = gr.Code(v["model.params"], language="json",
                                                    label="Model parameters (JSON)", lines=2)
                         with gr.Accordion("🖥️  Server & run", open=False):
@@ -1566,6 +1670,7 @@ def build_app():
                             run_btn = gr.Button("🚀  Launch", variant="primary", elem_classes="launch", scale=3)
                             stop_btn = gr.Button("■  Stop", variant="stop", scale=1)
                             preview_btn = gr.Button("🧩  Preview split", scale=1)
+                            speed_btn = gr.Button("⏱️  Speed check", scale=1)
                             save_btn = gr.Button("💾  Save preset", scale=1)
                         notice = gr.Markdown("", visible=False)
                         status = gr.HTML(render_status(ctrl.snapshot()))
@@ -1596,6 +1701,15 @@ def build_app():
                                                        x="client", y="samples", color="class",
                                                        title="Samples per client, coloured by class",
                                                        height=360, sort="x")
+                            with gr.Tab("⏱️  Speed check", id="speed"):
+                                speed_info = gr.HTML(
+                                    '<div class="algo-info empty">Press <b>Speed check</b> to time a few rounds of '
+                                    'the current settings with each speed option (baseline, cuDNN benchmark, '
+                                    'channels_last, torch.compile, torch.compile + CUDA graphs). Results are '
+                                    'not saved. With several algorithms selected, FedLabel (or the first one) '
+                                    'is timed.</div>')
+                                speed_table = gr.Dataframe(pd.DataFrame(), label="Speed per setting",
+                                                           wrap=True, interactive=False)
                             with gr.Tab("📜  Log", id="log"):
                                 log = gr.Code("", language=None, label="Log", lines=22, max_lines=22)
                             with gr.Tab("🔢  Metrics", id="metrics"):
@@ -1697,7 +1811,7 @@ def build_app():
                       holdout, val_ratio, test_ratio,
                       model_name, norm, model_params,
                       local_epochs, local_steps, optimizer, lr, momentum, weight_decay,
-                      prox_mu, grad_clip, precision, channels_last,
+                      prox_mu, grad_clip, precision, channels_last, cudnn_benchmark, compile_,
                       aggregator, rounds, num_clients, client_fraction, eval_every, server_params]
         assert len(components) == len(FIELDS)
         cfg_inputs = components + [algos, params_state]
@@ -1746,12 +1860,13 @@ def build_app():
                      concurrency_limit=1, concurrency_id="param-state").then(
             show_yaml, cfg_inputs, yaml_view)
 
-        # fast GPU mode <-> the two fields it sets
-        fast.input(lambda on: ("gpu", "bf16") if on else ("cpu", "fp32"), fast,
-                   [augment_device, precision]).then(show_yaml, cfg_inputs, yaml_view)
-        for comp in (augment_device, precision):
-            comp.input(lambda a, p: _is_fast({"data.augment_device": a, "strategy.precision": p}),
-                       [augment_device, precision], fast)
+        # fast GPU mode <-> the three fields it sets
+        fast.input(lambda on: ("gpu", "bf16", True) if on else ("cpu", "fp32", False), fast,
+                   [augment_device, precision, cudnn_benchmark]).then(show_yaml, cfg_inputs, yaml_view)
+        for comp in (augment_device, precision, cudnn_benchmark):
+            comp.input(lambda a, p, b: _is_fast({"data.augment_device": a, "strategy.precision": p,
+                                                 "strategy.cudnn_benchmark": b}),
+                       [augment_device, precision, cudnn_benchmark], fast)
 
         def on_algos(sel):
             sel = sel or []
@@ -1902,8 +2017,9 @@ def build_app():
                 time.sleep(0.5)
 
         def on_run(*vals):
-            if ctrl.running:
-                yield (warn("A job is already running — stop it first."), gr.update(), *[gr.update()] * 7)
+            if ctrl.running or speed.running:
+                yield (warn("A job or speed check is already running — stop it first."), gr.update(),
+                       *[gr.update()] * 7)
                 return
             try:
                 cfgs = _configs(*vals)
@@ -1922,11 +2038,40 @@ def build_app():
         run_btn.click(on_run, cfg_inputs, [notice, dash_tabs] + exp_outputs, show_progress="hidden")
 
         def on_stop():
+            if speed.stop():
+                return gr.update(value="⏹ Stopping the speed check after the current setting …", visible=True)
             if ctrl.stop():
                 return gr.update(value="⏹ Stopping after the current round …", visible=True)
             return gr.update(value="Nothing is running.", visible=True)
 
         stop_btn.click(on_stop, None, notice)
+
+        def on_speed(*vals):
+            if ctrl.running or speed.running:
+                yield warn("A job or speed check is already running — stop it first."), gr.update(), \
+                    gr.update(), gr.update()
+                return
+            try:
+                cfgs = _configs(*vals)
+            except Exception as e:  # noqa: BLE001
+                yield warn(e), gr.update(), gr.update(), gr.update()
+                return
+            cfg = next((c for c in cfgs if c.strategy.name == "fedlabel"), cfgs[0])
+            speed.start(cfg)
+            last = -1
+            yield gr.update(visible=False), gr.Tabs(selected="speed"), speed.summary(), speed.table()
+            while True:
+                running = speed.running
+                if speed.version != last:
+                    last = speed.version
+                    yield gr.update(), gr.update(), speed.summary(), speed.table()
+                if not running:
+                    yield gr.update(), gr.update(), speed.summary(), speed.table()
+                    return
+                time.sleep(0.5)
+
+        speed_btn.click(on_speed, cfg_inputs, [notice, dash_tabs, speed_info, speed_table],
+                        show_progress="hidden")
 
         def reattach_experiment():
             snap = ctrl.snapshot()
@@ -1981,7 +2126,7 @@ def build_app():
                                [grid_status, grid_table])
 
         def on_grid_run(path, only, extra, skip):
-            if ctrl.running:
+            if ctrl.running or speed.running:
                 yield ('<div class="status status-error"><div class="status-head"><span class="dot"></span>'
                        '<b>A job is already running — stop it first.</b></div></div>', *[gr.update()] * 3)
                 return

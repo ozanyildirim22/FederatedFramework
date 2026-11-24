@@ -60,6 +60,21 @@ def round_batches(loader, steps: int) -> Iterator:
                            pin_memory=loader.pin_memory, drop_last=False))
 
 
+COMPILE_MODES = ("default", "reduce-overhead", "max-autotune-no-cudagraphs", "max-autotune")
+
+
+def compile_mode(cfg) -> Optional[str]:
+    """``strategy.compile`` as a torch.compile mode, or None when off (``true`` = ``default``)."""
+    v = getattr(cfg, "compile", None)
+    if v is None or v is False or str(v).lower() in ("", "none", "off", "false", "0"):
+        return None
+    if v is True or str(v).lower() in ("true", "on", "1"):
+        return "default"
+    if v not in COMPILE_MODES:
+        raise ValueError(f"Unknown strategy.compile '{v}' (none | {' | '.join(COMPILE_MODES)})")
+    return str(v)
+
+
 class Strategy:
     #: does the strategy consume the unlabeled loader?
     uses_unlabeled: bool = True
@@ -80,6 +95,8 @@ class Strategy:
         self.total_steps: int = 0    # local steps in the current round
         self._channels_last = False
         self.aggregation_weight: Optional[float] = None   # set by strategies that define r_k
+        self._compile_mode = compile_mode(cfg)
+        self._compiled: Optional[Tuple[nn.Module, nn.Module]] = None   # (model, torch.compile(model))
 
     # ---------------------------------------------------------- server hooks
     # Some algorithms (FedMatch, FedTriNet) have a server-side part. In the
@@ -161,6 +178,17 @@ class Strategy:
             return "fp32"            # e.g. T4: bf16 would only be emulated (slower than fp32)
         return p
 
+    def training_forward(self, model: nn.Module) -> nn.Module:
+        """The module the loss functions call: ``model`` itself, or with ``strategy.compile`` a
+        ``torch.compile`` wrapper that shares its parameters (built once and reused: the
+        experiment trains the same model object every round). Only the trained model is
+        compiled; frozen copies (global / local / helper models) and evaluation stay eager."""
+        if self._compile_mode is None:
+            return model
+        if self._compiled is None or self._compiled[0] is not model:
+            self._compiled = (model, torch.compile(model, mode=self._compile_mode))
+        return self._compiled[1]
+
     # -------------------------------------------------------- loop pieces
     def prepare(self, model: nn.Module, device: torch.device) -> None:
         """Device / memory format, frozen copy of W_t and the FedProx anchor."""
@@ -190,12 +218,16 @@ class Strategy:
         amp_dtype = torch.bfloat16 if prec == "bf16" else torch.float16
         scaler = torch.amp.GradScaler("cuda", enabled=prec == "fp16")
         sums = sums if sums is not None else defaultdict(float)
+        fwd = self.training_forward(model)
+        cudagraphs = self._compile_mode == "reduce-overhead"
         for step in range(steps):
             self.step = step
             labeled = self._to_device(next(lab_it)) if lab_it else None
             unlabeled = self._to_device(next(unl_it)) if unl_it else None
+            if cudagraphs:                        # a new training iteration for CUDA graph trees
+                torch.compiler.cudagraph_mark_step_begin()
             with torch.autocast(self.device.type, dtype=amp_dtype, enabled=use_amp):
-                loss, logs = loss_fn(model, labeled, unlabeled)
+                loss, logs = loss_fn(fwd, labeled, unlabeled)
             prox = self.proximal_term(model)
             if prox is not None:
                 loss = loss + prox

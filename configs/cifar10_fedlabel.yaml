@@ -16,13 +16,19 @@ model:
 strategy:
   name: fedlabel              # supervised | pseudolabel | fixmatch | fedlabel
   local_epochs: 1
+  # 15 SGD steps per client and round for every method (FedLabel: tau = tau' = 15).
+  # One local epoch is only ~3 labeled steps (~100 labeled samples, batch 32) and ~1 unlabeled
+  # step (~400 unlabeled samples, batch 224) here; the paper counts tau in local iterations and
+  # found tau = 5 the worst. local_steps overrides local_epochs and FedLabel's sup/unsup_epochs.
+  local_steps: 15
   lr: 0.03
+  cudnn_benchmark: true       # fastest conv kernels per input shape (CUDA); results unchanged
   params:                     # FedLabel as in the ADD (Section 3.1, Algorithm 2)
     beta: 0.5                 # pseudo-label confidence threshold (paper appendix A: 0.3-0.5 best)
     lambda0: 1.0              # scale of the global-local consistency weight (lambda_0)
     lambda_u: 1.0             # weight of the pseudo-label cross-entropy
-    sup_epochs: 1             # tau: epochs on labeled data (Step 1)
-    unsup_epochs: 1           # tau': epochs on unlabeled data (Steps 2-3)
+    sup_epochs: 1             # tau: used only without strategy.local_steps / sup_steps
+    unsup_epochs: 1           # tau': used only without strategy.local_steps / unsup_steps
     confidence: variance      # h(.) = variance of the logits
     selection: adaptive       # adaptive | local | global (ablations)
     kl_direction: add         # add = KL(s(w_U) || s_bar) as in Eq. 2 | teacher

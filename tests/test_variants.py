@@ -658,3 +658,39 @@ def test_run_labels_from_grid_names(tmp_path):
         (d / "metrics.csv").write_text("round,test_acc\n1,0.5\n")
     got = {r["base"]: (r["variant"], r["seed"]) for r in gui.scan_runs(str(tmp_path))}
     assert got == cases
+
+
+# ------------------------------------------------------------- speed options
+@pytest.mark.parametrize("algo", ["fedlabel", "fedmatch", "fixmatch", "fedtrinet"])
+def test_compile_trains_through_the_wrapper(tmp_path, monkeypatch, algo):
+    """strategy.compile: the loss functions get a torch.compile wrapper that shares the model's
+    parameters. The eager backend stands in for Inductor (no Triton needed)."""
+    from ssfl.strategies import base
+    real = torch.compile
+    built = []
+
+    def fake_compile(model, mode=None):
+        built.append(mode)
+        return real(model, backend="eager")
+
+    monkeypatch.setattr(base.torch, "compile", fake_compile)
+    over = {"strategy.name": algo, "strategy.compile": "default"}
+    if algo == "fedtrinet":
+        over["strategy.params"] = {"pretrain_rounds": 1}
+    exp = Experiment(cfg_for(tmp_path, **over), verbose=False)
+    w0 = {k: v.clone() for k, v in exp.model.state_dict().items()}
+    hist = exp.run()
+    assert built == ["default"]                       # one wrapper, reused every round
+    assert all(not math.isnan(r["train_loss"]) for r in hist)
+    assert any(not torch.equal(w0[k], v) for k, v in exp.model.state_dict().items())
+    torch._dynamo.reset()
+
+
+def test_compile_mode_names():
+    from types import SimpleNamespace as NS
+    from ssfl.strategies.base import compile_mode
+    assert compile_mode(NS(compile=None)) is None and compile_mode(NS(compile=False)) is None
+    assert compile_mode(NS(compile="none")) is None and compile_mode(NS(compile=True)) == "default"
+    assert compile_mode(NS(compile="reduce-overhead")) == "reduce-overhead"
+    with pytest.raises(ValueError):
+        compile_mode(NS(compile="fast"))

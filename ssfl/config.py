@@ -57,6 +57,9 @@ class StrategyConfig:
     amp: bool = False                   # legacy switch: true = precision fp16
     precision: str = "fp32"             # fp32 | bf16 (fast on Ampere+ GPUs, no loss scaling) | fp16
     channels_last: bool = False         # NHWC memory layout for convolutions (CUDA only)
+    cudnn_benchmark: bool = False       # let cuDNN pick the fastest conv kernels per input shape (CUDA only)
+    compile: Optional[str] = None       # torch.compile the training forward: default | reduce-overhead |
+                                        # max-autotune-no-cudagraphs (None / false = off; needs Triton)
     grad_clip: Optional[float] = 5.0    # max gradient L2 norm (None disables)
     params: Dict[str, Any] = field(default_factory=dict)  # strategy-specific kwargs
 

@@ -223,7 +223,9 @@ class FedMatch(Strategy):
         self._helpers = []
 
     def _forward(self, model, x, mode):
-        return model(x, mode) if isinstance(model, DecomposedModel) else model(x)
+        # with strategy.compile the model arrives wrapped by torch.compile (``_orig_mod``)
+        plain = getattr(model, "_orig_mod", model)
+        return model(x, mode) if isinstance(plain, DecomposedModel) else model(x)
 
     def compute_loss(self, model, labeled, unlabeled):
         terms, logs = {}, {}
@@ -248,8 +250,9 @@ class FedMatch(Strategy):
                 logs["helper_agree"] = (pseudo == local_cls).float().mean()
             logs["num_helpers"] = float(len(h_logits))
             logs.update(_pl_stats(pseudo, mask, u_true))
-            if isinstance(model, DecomposedModel):
-                sig, psi = model.sigma(), list(model.psi)
+            plain = getattr(model, "_orig_mod", model)       # unwrap torch.compile
+            if isinstance(plain, DecomposedModel):
+                sig, psi = plain.sigma(), list(plain.psi)
                 if self.reg_reduction == "mean":
                     n = sum(p.numel() for p in psi)
                     terms["l2"] = sum(((s.detach() - p) ** 2).sum() for s, p in zip(sig, psi)) / n

@@ -5,6 +5,7 @@
     python -m ssfl --list
     python -m ssfl --gui
     python -m ssfl --grid configs/grids/thesis.yaml [--only organamnist] [--dry-run]
+    python -m ssfl --config configs/cifar10_fedlabel.yaml --bench 5   # speed settings compared
 """
 from __future__ import annotations
 
@@ -31,6 +32,9 @@ def main(argv=None) -> None:
     p.add_argument("--dry-run", action="store_true", help="with --grid: list the runs, train nothing")
     p.add_argument("--no-resume", action="store_true",
                    help="with --grid: also re-run experiments that already finished")
+    p.add_argument("--bench", type=int, metavar="ROUNDS",
+                   help="with --config: time ROUNDS rounds with and without channels_last, the cuDNN "
+                        "benchmark and torch.compile; nothing is written to disk")
     args = p.parse_args(argv)
 
     if args.list:
@@ -48,6 +52,10 @@ def main(argv=None) -> None:
         return
     if not args.config:
         p.error("--config is required")
+    if args.bench:
+        from .bench import bench
+        bench(args.config, args.bench, args.set)
+        return
     Experiment.from_yaml(args.config, args.set).run()
 
 

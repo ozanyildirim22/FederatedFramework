@@ -232,13 +232,25 @@ for `DATASETS`, `PARTITIONERS` and `MODELS`. See `examples/custom_algorithm.py`.
 
 On a large GPU the training step itself is fast, so the CPU becomes the bottleneck. It decodes
 and augments ~480 images per step, about 0.35-0.5 s per step for one process. Two options move
-that work to the GPU (**⚡ Fast GPU mode** in the GUI turns on both):
+that work to the GPU (**⚡ Fast GPU mode** in the GUI turns on both, plus the cuDNN benchmark):
 
 | Setting | What it does |
 |---|---|
 | `data.augment_device=gpu` | Keeps the dataset on the GPU (OrganAMNIST 27 MB, CIFAR-10 150 MB) and augments whole batches there: flip + reflect crop, RandAugment with torchvision's own ops and magnitudes, Cutout. About 40 ms per step instead of about 350 ms of CPU work on an RTX 3050 Laptop. Statistically the same views as the CPU pipeline, but not bit-identical: keep `cpu` to reproduce earlier runs. |
 | `strategy.precision=bf16` | bfloat16 autocast. It has the float32 range, so no loss scaling is needed (fp16, the old `amp`, made training diverge). Needs hardware bf16 (Ampere or newer); elsewhere it falls back to fp32. About 20% faster on an RTX 3050 Laptop. |
 | `strategy.channels_last=true` | NHWC memory layout for convolutions (optional). |
+| `strategy.cudnn_benchmark=true` | cuDNN tries its convolution algorithms once per input shape and keeps the fastest. Results are unchanged up to floating-point rounding. On in the CIFAR-10 preset. |
+| `strategy.compile=default` | `torch.compile` of the trained model (frozen copies and evaluation stay eager). Fuses GroupNorm / ReLU and similar ops into fewer GPU kernels, which helps when the CPU cannot launch kernels fast enough (small batches on a large GPU). `reduce-overhead` adds CUDA graphs. Needs Triton (Linux / Colab); the first round compiles (about a minute). Off by default. |
+
+To see which of `channels_last` / `cudnn_benchmark` / `compile` helps on your GPU, time a few rounds of each
+(training only, nothing is saved; the last column extrapolates to `server.rounds`):
+
+```bash
+python -m ssfl -c configs/cifar10_fedlabel.yaml --bench 5 --set data.augment_device=gpu strategy.precision=bf16
+```
+
+In SSFL Studio the **⏱️ Speed check** button (Experiment tab) does the same for the current settings
+(3 timed rounds per option) and shows the table in its own dashboard tab.
 
 On small GPUs (T4, laptops) the GPU itself is the bottleneck. CPU augmentation of the next batch
 already overlaps with training, so `augment_device=gpu` gains little there and can even be slower.
