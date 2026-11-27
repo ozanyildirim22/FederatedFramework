@@ -1,0 +1,39 @@
+# CIFAR-10 with the settings of the test1 Colab run (fedlabel/main.py in the
+# "Federated Learning" repo, branch test1):
+#   --model resnet34 --comms_round 800 --client_num_per_round 10 --batch_size 20 --local_lr 0.01
+#   --alpha 0.1 --label_ratio 0.2 --beta 0.95 --lambda_0 1.0 --tau 15 --tau_prime 15
+# Lighter than cifar10_fedlabel.yaml: unlabeled batches of 20 instead of 224 images.
+# Data still comes from the framework.
+name: cifar10_fedlabel_test1
+seed: 42
+device: auto
+data:
+  dataset: cifar10
+  root: ./data
+  partitioner: dirichlet
+  alpha: 0.1
+  labeled_ratio: 0.2
+  batch_size: 20              # test1: --batch_size 20
+  unlabeled_batch_ratio: 1    # test1 uses the same batch size (20) for unlabeled data
+model:
+  name: resnet34
+  norm: bn                    # test1's ResNets use BatchNorm
+strategy:
+  name: fedlabel
+  local_epochs: 1
+  lr: 0.01                    # test1: --local_lr 0.01
+  cudnn_benchmark: true
+  params:
+    beta: 0.95                # test1: --beta 0.95
+    lambda0: 1.0
+    lambda_u: 1.0
+    sup_steps: 15             # test1: --tau 15
+    unsup_steps: 15           # test1: --tau_prime 15
+    confidence: variance
+    selection: adaptive
+server:
+  aggregator: fedavg
+  rounds: 800                 # test1: --comms_round 800
+  num_clients: 100
+  client_fraction: 0.1        # test1: --client_num_per_round 10 (of 100)
+  eval_every: 50              # test1: --eval_every 50 (default)

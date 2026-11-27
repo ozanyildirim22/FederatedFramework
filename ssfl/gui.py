@@ -80,6 +80,8 @@ PRESET_INFO = {
     "organamnist_fedlabel.yaml": ("🫁", "OrganAMNIST", "Cross-silo · 10 hospitals · 100 rounds"),
     "pathmnist_fedlabel.yaml": ("🔬", "PathMNIST", "Cross-silo · 10 hospitals · 100 rounds"),
     "cifar10_fedlabel.yaml": ("🖼️", "CIFAR-10", "Cross-device · 100 clients · ResNet-34"),
+    "organamnist_fedlabel_test1.yaml": ("🫁", "OrganAMNIST (test1)", "test1 settings · 3 of 10 clients · fast"),
+    "cifar10_fedlabel_test1.yaml": ("🖼️", "CIFAR-10 (test1)", "test1 settings · batch 20 · fast"),
 }
 
 #: parameter -> (help text, choices or None)

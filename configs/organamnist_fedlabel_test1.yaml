@@ -1,0 +1,39 @@
+# OrganAMNIST with the settings of the test1 Colab run (fedlabel/main.py in the
+# "Federated Learning" repo, branch test1):
+#   --model resnet18 --comms_round 800 --client_num_per_round 3 --batch_size 20 --local_lr 0.01
+#   --alpha 0.1 --label_ratio 0.05 --beta 0.95 --lambda_0 1.0 --tau 30 --tau_prime 30
+# Much lighter than organamnist_fedlabel.yaml: 3 of 10 clients per round, 30 + 30 steps of
+# 20 images, so a round takes seconds instead of minutes. Data still comes from the framework.
+name: organamnist_fedlabel_test1
+seed: 42
+device: auto
+data:
+  dataset: organamnist
+  root: ./data
+  image_size: 28
+  partitioner: dirichlet
+  alpha: 0.1
+  labeled_ratio: 0.05
+  batch_size: 20              # test1: --batch_size 20
+  unlabeled_batch_ratio: 1    # test1 uses the same batch size (20) for unlabeled data
+model:
+  name: resnet18
+  norm: bn                    # test1's ResNets use BatchNorm
+strategy:
+  name: fedlabel
+  local_epochs: 1
+  lr: 0.01                    # test1: --local_lr 0.01
+  params:
+    beta: 0.95                # test1: --beta 0.95
+    lambda0: 1.0
+    lambda_u: 1.0
+    sup_steps: 30             # test1: --tau 30
+    unsup_steps: 30           # test1: --tau_prime 30
+    confidence: variance
+    selection: adaptive
+server:
+  aggregator: fedavg
+  rounds: 800                 # test1: --comms_round 800
+  num_clients: 10
+  client_fraction: 0.3        # test1: --client_num_per_round 3 (of 10)
+  eval_every: 50              # test1: --eval_every 50 (default)
