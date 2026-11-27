@@ -1763,6 +1763,7 @@ def build_app():
                 with gr.Row():
                     runs_dir = gr.Textbox(v["output_dir"], label="Runs folder", scale=4)
                     refresh_btn = gr.Button("🔄  Refresh", scale=1)
+                    clear_open_btn = gr.Button("🗑️  Clear runs", variant="stop", scale=1)
                 with gr.Row():
                     f_dataset = gr.Dropdown([], value=[], multiselect=True, label="Dataset filter", scale=2)
                     f_algo = gr.Dropdown([], value=[], multiselect=True, label="Algorithm filter", scale=2)
@@ -2249,6 +2250,8 @@ def build_app():
                    + (f" Kept {len(skipped)}:<ul>{kept}</ul>" if skipped else "") + "</div>")
             return gr.update(choices=clear_choices(d), value=[]), msg, gr.update(visible=False)
 
+        clear_open_btn.click(lambda d: (gr.Tabs(selected="clear"), gr.update(choices=clear_choices(d))),
+                             runs_dir, [res_tabs, clear_pick])
         clear_btn.click(on_clear_ask, [clear_pick, runs_dir], [clear_msg, clear_confirm_row])
         clear_no.click(lambda: ("", gr.update(visible=False)), None, [clear_msg, clear_confirm_row])
         clear_yes.click(on_clear_confirm, [clear_pick, runs_dir], [clear_pick, clear_msg, clear_confirm_row]).then(
