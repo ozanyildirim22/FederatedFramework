@@ -422,6 +422,8 @@ class RunController:
         """``plan``: ``(name, cfg, status)`` or ``(name, cfg, status, resume_dir)`` rows; a
         row with ``resume_dir`` continues that run folder (:meth:`Experiment.resume`)."""
         self.kind = kind
+        self.parallel = getattr(self, "parallel", 1)
+        self._runner = None
         self.plan = [{"name": p[0], "cfg": p[1], "status": p[2], "history": [], "best": None,
                       "out_dir": None, "error": None, "started": None, "ended": None,
                       "resume": p[3] if len(p) > 3 else None}
@@ -437,11 +439,15 @@ class RunController:
     def running(self) -> bool:
         return self.thread is not None and self.thread.is_alive()
 
-    def start(self, plan: Sequence[Tuple[str, ExperimentConfig, str]], kind: str) -> None:
+    def start(self, plan: Sequence[Tuple[str, ExperimentConfig, str]], kind: str, parallel: int = 1) -> None:
+        """``parallel > 1``: that many runs at the same time, each in its own process
+        (:mod:`ssfl.parallel`); 1 = one after another in this process."""
         if self.running:
             raise RuntimeError("An experiment is already running - stop it first.")
         with self.lock:
             self._reset(plan, kind)
+            self.parallel = max(1, int(parallel or 1))
+            self._runner = None
             self.state, self.started = "running", time.time()
         self.stop_event.clear()
         self.pause_event.clear()
@@ -452,6 +458,8 @@ class RunController:
         if not self.running:
             return False
         self.stop_event.set()
+        if self._runner is not None:
+            self._runner.stop()
         with self.lock:
             self.state = "stopping"
             self.message = "Stopping after the current round …"
@@ -464,6 +472,8 @@ class RunController:
         if not self.running or self.stop_event.is_set():
             return False
         self.pause_event.set()
+        if self._runner is not None:
+            self._runner.pause()
         with self.lock:
             self.state = "pausing"
             self.message = "Pausing after the current round (saving a checkpoint) …"
@@ -477,6 +487,9 @@ class RunController:
             self.version += 1
 
     def _work(self) -> None:
+        if self.parallel > 1:
+            self._work_parallel()
+            return
         from .experiment import Experiment
 
         errors = 0
@@ -565,6 +578,69 @@ class RunController:
                     run["status"] = "cancelled"
             self.version += 1
 
+    def _work_parallel(self) -> None:
+        """The queue as separate processes, ``self.parallel`` at a time; the plan rows
+        follow the jobs (status, history, best accuracy) for the dashboard."""
+        import os
+
+        from .parallel import Job, ParallelRunner
+        rows = [r for r in self.plan if r["status"] == "queued"]
+        jobs = [Job(r["name"], r["cfg"], r.get("resume")) for r in rows]
+        runner = ParallelRunner(jobs, self.parallel, log=self._log, cwd=os.getcwd())
+        with self.lock:
+            self._runner = runner
+            self.message = (f"Starting {min(self.parallel, len(jobs))} of {len(jobs)} runs in parallel "
+                            "(each in its own process) …")
+            self.version += 1
+        if self.pause_event.is_set():                 # pressed while the runner was being built
+            runner.pause()
+        if self.stop_event.is_set():
+            runner.stop()
+
+        def on_update(rn):
+            with self.lock:
+                for r, j in zip(rows, jobs):
+                    if j.history is not r.get("_hist_src"):
+                        r["_hist_src"] = j.history
+                        r["history"] = [dict(h) for h in j.history]
+                        accs = [h["test_acc"] for h in j.history if "test_acc" in h and h["test_acc"] == h["test_acc"]]
+                        r["best"] = max(accs) if accs else None
+                    r["status"] = j.status
+                    r["out_dir"] = str(j.folder) if j.folder else None
+                    r["started"], r["ended"], r["error"] = j.started, j.ended, j.error
+                    r["data_ready"] = j.status != "queued"
+                running = [i for i, r in enumerate(self.plan) if r["status"] == "running"]
+                if running:
+                    self.current = running[0]
+                    if self.state == "running":
+                        self.message = (f"Training {len(running)} runs in parallel" if len(running) > 1
+                                        else f"Training {self.plan[running[0]]['name']}")
+                else:
+                    started = [i for i, r in enumerate(self.plan) if r["status"] not in ("queued", "finished")]
+                    self.current = started[-1] if started else self.current
+                self.version += 1
+
+        try:
+            runner.run(on_update)
+        except Exception:  # noqa: BLE001 - show any error in the UI
+            self._log(traceback.format_exc())
+        with self.lock:
+            st = [r["status"] for r in rows]
+            if self.stop_event.is_set():
+                self.state, self.message = "stopped", "Stopped by user."
+            elif any(x in ("paused", "waiting") for x in st):
+                self.state = "paused"
+                self.message = "Paused — press ⏯ Resume to continue" if self.kind == "experiment" \
+                    else "Paused — run the grid again to continue"
+            elif any(x == "error" for x in st):
+                self.state = "error"
+                self.message = f"Finished with {st.count('error')} failed run(s) - see the log."
+            else:
+                self.state, self.message = "done", "All runs finished."
+            for r in rows:
+                r.pop("_hist_src", None)
+            self.version += 1
+
     def _pause_queue(self, i: int, run: Dict[str, Any]) -> None:
         """After the run at ``i`` paused: the runs still waiting get a ``queued`` run folder
         (experiment queue), so Resume continues them too; a grid finds them again itself."""
@@ -596,8 +672,9 @@ class RunController:
             return {
                 "kind": self.kind, "state": self.state, "message": self.message,
                 "current": self.current, "started": self.started, "version": self.version,
+                "parallel": self.parallel,
                 "logs": list(self.logs),
-                "plan": [{**{k: v for k, v in r.items() if k != "history"},
+                "plan": [{**{k: v for k, v in r.items() if k not in ("history", "_hist_src")},
                           "history": list(r["history"])} for r in self.plan],
             }
 
@@ -621,6 +698,16 @@ def _eta(snap) -> Optional[float]:
     if cur < 0 or snap["state"] not in ("running", "stopping", "pausing"):
         return None
     run = plan[cur]
+    par = snap.get("parallel", 1) or 1
+    if par > 1:                         # remaining work of all runs, spread over the parallel slots
+        speeds = [float(np.mean([h.get("time_s", 0) for h in r["history"][-5:]]))
+                  for r in plan if r["status"] == "running" and r["history"]]
+        if not speeds:
+            return None
+        per_round = float(np.mean(speeds))
+        left = sum(max(0, r["cfg"].server.rounds - len(r["history"])) for r in plan
+                   if r["status"] in ("running", "queued"))
+        return per_round * left / min(par, max(1, sum(r["status"] in ("running", "queued") for r in plan)))
     times = [r.get("time_s", 0) for r in run["history"][-5:]]
     if not times:
         return None
@@ -647,7 +734,12 @@ def render_status(snap) -> str:
     if 0 <= cur < len(plan):
         r = plan[cur]
         pos = active.index(r) + 1 if r in active else cur + 1
-        head += f'<span class="muted">{html.escape(r["name"])} · run {pos}/{len(active)}</span>'
+        n_run = sum(x["status"] == "running" for x in plan)
+        if snap.get("parallel", 1) > 1 and n_run > 1:
+            head += (f'<span class="muted">{n_run} runs in parallel · '
+                     f'{sum(x["status"] == "done" for x in plan)}/{len(active)} done</span>')
+        else:
+            head += f'<span class="muted">{html.escape(r["name"])} · run {pos}/{len(active)}</span>'
     eta = _eta(snap)
     foot = [html.escape(snap["message"])]
     if (0 <= cur < len(plan) and plan[cur]["status"] == "running" and not plan[cur].get("data_ready")
@@ -927,15 +1019,19 @@ STATUS_LABEL = {"finished": "✓ finished", "running": "▶ running", "paused": 
                 "error": "✗ error", "interrupted": "⚠ interrupted", "partial": "… partial"}
 
 
-def run_start_key(run_dir: Path) -> Tuple[str, float]:
-    """Sort key = when the run folder was created (the ``_YYYYMMDD-HHMMSS`` stamp in its name).
-    A paused queue then resumes in its original order: the paused run started before the
-    queued runs' folders were written."""
-    m = re.search(r"_(\d{8}-\d{6})(?:-(\d+))?$", run_dir.name)
+def run_start_key(run_dir: Path) -> Tuple[int, float, str, float]:
+    """Order in which ⏯ Resume continues runs: runs that already started (paused, stopped,
+    interrupted) first, by their start stamp (``_YYYYMMDD-HHMMSS`` in the folder name), then
+    runs that never started, in the order they were queued."""
+    summ = _read_json(Path(run_dir) / "summary.json")
+    queued = summ.get("status") == "queued"
+    m = re.search(r"_(\d{8}-\d{6})(?:-(\d+))?$", Path(run_dir).name)
     if m:
-        return (m.group(1), float(m.group(2) or 0))
-    from .cleanup import _mtime
-    return (time.strftime("%Y%m%d-%H%M%S", time.localtime(_mtime(run_dir))), 0.0)
+        stamp, n = m.group(1), float(m.group(2) or 0)
+    else:
+        from .cleanup import _mtime
+        stamp, n = time.strftime("%Y%m%d-%H%M%S", time.localtime(_mtime(Path(run_dir)))), 0.0
+    return (1 if queued else 0, float(summ.get("queued_at") or 0) if queued else 0.0, stamp, n)
 
 
 def scan_runs(runs_dir: str) -> List[Dict[str, Any]]:
@@ -1745,6 +1841,8 @@ def build_app():
                                     v["server.checkpoint_every"], precision=0,
                                     label="Checkpoint every k rounds",
                                     info="lets ⏯ Resume continue after a crash / disconnect; 0 = only on ⏸ Pause")
+                            parallel_n = gr.Number(1, precision=0, minimum=1, maximum=16, label="Parallel runs",
+                                                   info="ticked algorithms (and ⏯ Resume) runs at the same time, each in its own process; 2-4 on an A100 / H100 (the GPU waits on Python with small batches), 1 on small GPUs")
                             server_params = gr.Code(v["server.params"], language="json",
                                                     label="Aggregator parameters (JSON)", lines=2)
                             with gr.Row():
@@ -1839,6 +1937,8 @@ def build_app():
                     grid_extra = gr.Textbox(env_extra, label="Extra overrides", scale=3,
                                             placeholder="e.g. server.rounds=50 output_dir=/content/drive/MyDrive/ssfl/runs")
                     grid_skip = gr.Checkbox(True, label="Skip finished", scale=1)
+                    grid_parallel = gr.Number(1, precision=0, minimum=1, maximum=16, label="Parallel runs",
+                                              info="runs at the same time, each in its own process; 2-4 on an A100 / H100 (the GPU waits on Python with small batches), 1 on small GPUs", scale=1)
                 with gr.Row():
                     grid_preview_btn = gr.Button("🔍  Preview runs", scale=1)
                     grid_run_btn = gr.Button("🚀  Run grid", variant="primary", elem_classes="launch", scale=2)
@@ -2140,6 +2240,7 @@ def build_app():
                 time.sleep(0.5)
 
         def on_run(*vals):
+            *vals, par = vals
             if ctrl.running or speed.running:
                 yield (warn("A job or speed check is already running — stop it first."), gr.update(),
                        *[gr.update()] * 7)
@@ -2149,7 +2250,7 @@ def build_app():
             except Exception as e:  # noqa: BLE001
                 yield (warn(e), gr.update(), *[gr.update()] * 7)
                 return
-            ctrl.start([(c.name, c, "queued") for c in cfgs], "experiment")
+            ctrl.start([(c.name, c, "queued") for c in cfgs], "experiment", parallel=int(par or 1))
             first = True
             for out in stream(exp_view, "experiment"):
                 # hide an old notice once; later updates leave it alone so a warning from a
@@ -2158,7 +2259,8 @@ def build_app():
                        gr.Tabs(selected="charts") if first else gr.update(), *out)
                 first = False
 
-        run_btn.click(on_run, cfg_inputs, [notice, dash_tabs] + exp_outputs, show_progress="hidden")
+        run_btn.click(on_run, cfg_inputs + [parallel_n], [notice, dash_tabs] + exp_outputs,
+                      show_progress="hidden")
 
         def on_stop():
             if speed.stop():
@@ -2200,7 +2302,7 @@ def build_app():
         resume_btn.click(on_resume_open, [output_dir], [notice, resume_box, resume_pick])
         resume_cancel.click(lambda: gr.update(visible=False), None, resume_box)
 
-        def on_resume_go(paths):
+        def on_resume_go(paths, par):
             if ctrl.running or speed.running:
                 yield (warn("A job or speed check is already running — stop it first."), gr.update(),
                        gr.update(), *[gr.update()] * 7)
@@ -2217,7 +2319,7 @@ def build_app():
                     yield (warn(f"{p.name}: {e}"), gr.update(), gr.update(), *[gr.update()] * 7)
                     return
                 plan.append((cfg.name, cfg, "queued", str(p)))
-            ctrl.start(plan, "experiment")
+            ctrl.start(plan, "experiment", parallel=int(par or 1))
             first = True
             for out in stream(exp_view, "experiment"):
                 yield (gr.update(visible=False) if first else gr.update(),
@@ -2225,7 +2327,7 @@ def build_app():
                        gr.update(visible=False) if first else gr.update(), *out)
                 first = False
 
-        resume_go.click(on_resume_go, [resume_pick], [notice, dash_tabs, resume_box] + exp_outputs,
+        resume_go.click(on_resume_go, [resume_pick, parallel_n], [notice, dash_tabs, resume_box] + exp_outputs,
                         show_progress="hidden")
 
         def on_speed(*vals):
@@ -2316,7 +2418,7 @@ def build_app():
         grid_preview_btn.click(on_grid_preview, [grid_file, grid_only, grid_extra, grid_skip],
                                [grid_status, grid_table])
 
-        def on_grid_run(path, only, extra, skip):
+        def on_grid_run(path, only, extra, skip, par):
             if ctrl.running or speed.running:
                 yield ('<div class="status status-error"><div class="status-head"><span class="dot"></span>'
                        '<b>A job is already running — stop it first.</b></div></div>', *[gr.update()] * 3)
@@ -2327,10 +2429,10 @@ def build_app():
                 yield (f'<div class="status status-error"><div class="status-head"><span class="dot"></span>'
                        f'<b>{html.escape(str(e))}</b></div></div>', *[gr.update()] * 3)
                 return
-            ctrl.start(plan, "grid")
+            ctrl.start(plan, "grid", parallel=int(par or 1))
             yield from stream(grid_view, "grid")
 
-        grid_run_btn.click(on_grid_run, [grid_file, grid_only, grid_extra, grid_skip], grid_outputs,
+        grid_run_btn.click(on_grid_run, [grid_file, grid_only, grid_extra, grid_skip, grid_parallel], grid_outputs,
                            show_progress="hidden")
         grid_stop_btn.click(lambda: ctrl.stop() and None, None, None)
 

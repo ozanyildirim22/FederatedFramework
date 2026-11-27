@@ -133,14 +133,17 @@ def resumable_dir(cfg: ExperimentConfig) -> Optional[Path]:
 
 
 def run_grid(path: str | Path, only: Sequence[str] = (), dry_run: bool = False,
-             resume: bool = True, extra: Optional[Sequence[str]] = None) -> List[str]:
+             resume: bool = True, extra: Optional[Sequence[str]] = None, parallel: int = 1) -> List[str]:
     """Run every experiment of the grid. With ``resume`` (default) finished runs are skipped
     and paused / interrupted ones continue from their checkpoint. Ctrl+C pauses the current
-    run after its round and stops the grid; run the same command again to continue."""
+    run after its round and stops the grid; run the same command again to continue.
+    ``parallel > 1`` runs that many experiments at the same time, each in its own process
+    (:mod:`ssfl.parallel`)."""
     from .experiment import Experiment, run_pausable
 
     runs = [(n, c) for n, c in expand_grid(path, extra) if all(o in n for o in only)]
     done: List[str] = []
+    todo = []
     for i, (name, cfg) in enumerate(runs, 1):
         skip = resume and _finished(cfg)
         cont = resumable_dir(cfg) if resume and not skip else None
@@ -149,10 +152,20 @@ def run_grid(path: str | Path, only: Sequence[str] = (), dry_run: bool = False,
         print(f"[grid {i}/{len(runs)}] {name}: {status}", flush=True)
         if skip or dry_run:
             continue
+        if parallel > 1:
+            todo.append((name, cfg, cont))
+            continue
         exp = Experiment.resume(cont) if cont else Experiment(cfg)
         run_pausable(exp)
         if exp.paused:
             print(f"[grid] paused at {name}; run the same command again to continue.", flush=True)
             break
         done.append(name)
+    if todo:
+        from .parallel import Job, run_parallel_cli
+        print(f"[grid] {len(todo)} runs, {parallel} at a time", flush=True)
+        jobs = run_parallel_cli([Job(n, c, cont) for n, c, cont in todo], parallel)
+        done = [j.name for j in jobs if j.status == "done"]
+        if any(j.status in ("paused", "waiting") for j in jobs):
+            print("[grid] paused; run the same command again to continue.", flush=True)
     return done

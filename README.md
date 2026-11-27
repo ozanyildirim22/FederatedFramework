@@ -62,6 +62,7 @@ python -m ssfl --gui          # opens http://127.0.0.1:7860
   spread across clients. Refreshing the page re-attaches to a running job.
   **⏸ Pause** finishes the current round, saves a checkpoint and stops the queue (algorithms
   still waiting are saved too); **⏯ Resume** lists the paused runs and continues them from there.
+  **Parallel runs** (*Server & run*) runs the ticked algorithms at the same time (see below).
 * **🗺️ Thesis grid** — run `configs/grids/thesis.yaml` (or the seconds-long `demo.yaml`)
   with a live status table; finished runs are skipped, paused ones continue (⏸ Pause, then
   Run grid again).
@@ -117,6 +118,22 @@ python -m ssfl --grid configs/grids/thesis.yaml --set output_dir=/content/drive/
 A run whose `runs/<name>_*/summary.json` already exists is skipped, so an interrupted grid
 continues where it stopped (`--no-resume` runs everything again). A paused or interrupted run with
 a checkpoint continues from that checkpoint instead of starting again.
+
+### Parallel runs
+
+With small batches a large GPU mostly waits for Python (an A100 is often only 25-30% busy), so
+running several experiments **at the same time** finishes a batch of runs much sooner. Each run is
+its own Python process (one process per run avoids Python's global interpreter lock) and gives the
+same result as when it runs alone.
+
+* GUI: **Parallel runs** under *Server & run* (Experiment tab: the ticked algorithms; also used by
+  ⏯ Resume) and next to *Skip finished* in the Thesis grid tab. ⏸ Pause / ■ Stop act on every
+  running run.
+* Command line: `python -m ssfl --grid configs/grids/thesis.yaml --parallel 3`. Ctrl+C pauses all
+  running runs after their round, Ctrl+C again stops them; the same command continues later.
+* How many: 2-4 on an A100 / H100 (each run needs ~1-2 GB of GPU memory and one CPU core);
+  1 on small GPUs, which are already busy with one run. Datasets are downloaded once before the
+  runs start.
 
 ### Pause and resume
 

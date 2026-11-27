@@ -36,6 +36,14 @@ Callback = Callable[[int, Dict[str, float], "Experiment"], None]
 #: file in the run folder that holds everything needed to continue a run
 CHECKPOINT = "checkpoint.pt"
 CHECKPOINT_INFO = "checkpoint.json"
+#: control files another process (the GUI / a parallel runner) creates in the run folder:
+#: the run pauses / stops after its current round and deletes the file
+PAUSE_FILE = "PAUSE"
+STOP_FILE = "STOP"
+
+
+class StopRequested(Exception):
+    """Raised after a round when a STOP control file was found (run status: stopped)."""
 CHECKPOINT_VERSION = 1
 #: config entries that may differ when a run is resumed (where and how long it runs,
 #: not what it trains)
@@ -110,6 +118,7 @@ def write_queued_run(cfg: ExperimentConfig) -> Path:
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     (out / "summary.json").write_text(json.dumps({
         "name": cfg.name, "status": "queued", "started_at": None, "updated_at": now,
+        "queued_at": time.time(),                       # keeps the queue order for Resume
         "rounds_done": 0, "rounds_planned": cfg.server.rounds}, indent=2))
     return out
 
@@ -260,6 +269,16 @@ class Experiment:
         self._resumes = int(ck.get("resumes", 0)) + 1
         set_rng_state(ck["rng"])                # last: nothing else may draw from them now
 
+    def _check_control_files(self) -> None:
+        """PAUSE / STOP files written into the run folder by another process."""
+        stop, pause = self.out_dir / STOP_FILE, self.out_dir / PAUSE_FILE
+        if stop.exists():
+            stop.unlink(missing_ok=True)
+            raise StopRequested(f"{STOP_FILE} file in {self.out_dir}")
+        if pause.exists():
+            pause.unlink(missing_ok=True)
+            self.request_pause()
+
     def _elapsed(self) -> float:
         return self._elapsed_before + (time.time() - self._t_start) + self.setup_s
 
@@ -366,7 +385,8 @@ class Experiment:
             return self._run()
         except BaseException as e:                     # stopped from the GUI, Ctrl+C, crash
             if self.history:
-                self._write_summary("stopped" if type(e).__name__ in ("_Stopped", "KeyboardInterrupt")
+                self._write_summary("stopped" if type(e).__name__ in ("_Stopped", "KeyboardInterrupt",
+                                                                      "StopRequested")
                                     else "error")
             raise
 
@@ -399,6 +419,7 @@ class Experiment:
             self._write_summary("running")
             for cb in self.callbacks:
                 cb(rnd, rec, self)              # may call request_pause() (GUI) or raise (stop)
+            self._check_control_files()
             if rnd < rounds and (self.pause_requested or (every and rnd % every == 0)):
                 self.save_checkpoint()
             if self.pause_requested and rnd < rounds:

@@ -4,7 +4,7 @@
     python -m ssfl --config configs/cifar10_fedlabel.yaml --set strategy.name=fixmatch server.rounds=50
     python -m ssfl --list
     python -m ssfl --gui
-    python -m ssfl --grid configs/grids/thesis.yaml [--only organamnist] [--dry-run]
+    python -m ssfl --grid configs/grids/thesis.yaml [--only organamnist] [--dry-run] [--parallel 3]
     python -m ssfl --config configs/cifar10_fedlabel.yaml --bench 5   # speed settings compared
     python -m ssfl --clear-runs [--runs-dir DIR] [--only TEXT] [--algorithm NAME] [--status unfinished] [--dry-run] [--yes]
     python -m ssfl --resume runs/cifar10_fedlabel_20261127-150500 [--set server.rounds=1500]
@@ -47,6 +47,9 @@ def main(argv=None) -> None:
     p.add_argument("--yes", "-y", action="store_true", help="with --clear-runs: do not ask")
     p.add_argument("--no-resume", action="store_true",
                    help="with --grid: also re-run experiments that already finished")
+    p.add_argument("--parallel", type=int, default=1, metavar="N",
+                   help="with --grid: run N experiments at the same time, each in its own process "
+                        "(large GPUs; e.g. 3 on an A100)")
     p.add_argument("--resume", metavar="RUN_DIR",
                    help="continue a paused / stopped / interrupted run from its checkpoint.pt "
                         "(--set may change e.g. server.rounds)")
@@ -74,7 +77,11 @@ def main(argv=None) -> None:
             print(f"{r['status']:12s} round {r['rounds_done']}/{r['rounds_planned']}  {r['path']}")
         return
     if args.resume:
-        run_pausable(Experiment.resume(args.resume, args.set))
+        from .experiment import StopRequested
+        try:
+            run_pausable(Experiment.resume(args.resume, args.set))
+        except StopRequested:                   # STOP file from the GUI / a parallel runner
+            print("[ssfl] stopped.", flush=True)
         return
     if args.clear_runs:
         from .cleanup import clear_runs_cli
@@ -84,7 +91,7 @@ def main(argv=None) -> None:
     if args.grid:
         from .grid import run_grid
         run_grid(args.grid, only=args.only, dry_run=args.dry_run, resume=not args.no_resume,
-                 extra=args.set)
+                 extra=args.set, parallel=max(1, args.parallel))
         return
     if not args.config:
         p.error("--config is required")
