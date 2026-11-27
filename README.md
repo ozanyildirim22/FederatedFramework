@@ -60,8 +60,11 @@ python -m ssfl --gui          # opens http://127.0.0.1:7860
   The dashboard shows live KPI cards (test accuracy, best accuracy, pseudo-label mask
   and accuracy, loss, ETA) and charts; **🧩 Preview split** shows how the classes are
   spread across clients. Refreshing the page re-attaches to a running job.
+  **⏸ Pause** finishes the current round, saves a checkpoint and stops the queue (algorithms
+  still waiting are saved too); **⏯ Resume** lists the paused runs and continues them from there.
 * **🗺️ Thesis grid** — run `configs/grids/thesis.yaml` (or the seconds-long `demo.yaml`)
-  with a live status table; finished runs are skipped.
+  with a live status table; finished runs are skipped, paused ones continue (⏸ Pause, then
+  Run grid again).
 * **🏆 Results** — leaderboard, curves of any metric, and the **thesis table**
   (best accuracy per algorithm × dataset × label ratio) with CSV and LaTeX download.
 * **📘 Guide** — what every algorithm does and how to use the studio.
@@ -112,7 +115,30 @@ python -m ssfl --grid configs/grids/thesis.yaml --set output_dir=/content/drive/
 ```
 
 A run whose `runs/<name>_*/summary.json` already exists is skipped, so an interrupted grid
-continues where it stopped (`--no-resume` runs everything again).
+continues where it stopped (`--no-resume` runs everything again). A paused or interrupted run with
+a checkpoint continues from that checkpoint instead of starting again.
+
+### Pause and resume
+
+A run can be paused and continued later, also on another day or after a Colab disconnect:
+
+* **Pause**: GUI **⏸ Pause**, or **Ctrl+C** on the command line (Ctrl+C twice stops at once). The run
+  finishes its current round, writes `checkpoint.pt` and gets the status `paused`.
+* **Automatic checkpoints**: every `server.checkpoint_every` rounds (default 25; GUI *Server & run*),
+  so a crashed or disconnected run can be continued from its last checkpoint; the rounds after it
+  are trained again. `0` = checkpoints only on pause.
+* **Resume**: GUI **⏯ Resume**, or
+
+```bash
+python -m ssfl --list-resumable --runs-dir /content/drive/MyDrive/ssfl/runs
+python -m ssfl --resume /content/drive/MyDrive/ssfl/runs/cifar10_fedlabel_l0p2_a0p1_20261127-150500
+python -m ssfl --resume runs/<run folder> --set server.rounds=1500       # also: train longer
+```
+
+The run continues in the same folder: `metrics.csv` keeps the earlier rounds and the result is the
+same as without the break (same model, client sampling and random numbers). The checkpoint holds the
+global model, the history, every random generator and the algorithm's server-side state (FedMatch
+helpers, FedTriNet local models, server momentum); it is deleted when the run finishes.
 
 To clear previous runs (e.g. after an algorithm change), delete their folders. The command lists the
 matching runs and asks first; a run that is still running is never deleted. The GUI has the same
@@ -121,7 +147,7 @@ option under **Results → 🗑️ Clear runs**.
 ```bash
 python -m ssfl --clear-runs --dry-run                                # list every run folder in ./runs
 python -m ssfl --clear-runs --algorithm fedlabel                     # all FedLabel runs
-python -m ssfl --clear-runs --status unfinished --yes                # stopped / error / interrupted / partial, no prompt
+python -m ssfl --clear-runs --status unfinished --yes                # paused / queued / stopped / error / interrupted / partial
 python -m ssfl --clear-runs --runs-dir /content/drive/MyDrive/ssfl/runs --only organamnist
 ```
 
@@ -137,11 +163,12 @@ Every run writes `runs/<name>_<timestamp>/` with:
 * `config.yaml`: **every** setting, including all algorithm and aggregator parameters
   (defaults written out), so this file alone reproduces the run;
 * `metrics.csv`: per round loss, mask rate, pseudo-label accuracy, test accuracy and time;
-* `summary.json`: status (`running` / `finished` / `stopped` / `error`), start time, setup /
+* `summary.json`: status (`running` / `paused` / `finished` / `stopped` / `error`), start time, setup /
   training / total time, seconds per round, best accuracy and its round, final metrics, DataLoader
   workers, precision, and the environment (GPU, PyTorch, Python, code commit). It is updated after
   every round, so stopped or interrupted runs keep their timing too;
-* `global_model.pt`: the final global model.
+* `global_model.pt`: the final global model;
+* `checkpoint.pt` + `checkpoint.json`: only while a run is paused / unfinished (see *Pause and resume*).
 
 The GUI's **🏆 Results → 🔍 Run details** shows all of this for one run, with its curves, download
 buttons and **Load these settings into Experiment**.

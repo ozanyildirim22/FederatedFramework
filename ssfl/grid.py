@@ -119,18 +119,40 @@ def _finished(cfg: ExperimentConfig) -> bool:
     return any(run_finished(p) for p in out.glob(f"{cfg.name}_*/summary.json"))
 
 
+def resumable_dir(cfg: ExperimentConfig) -> Optional[Path]:
+    """The newest folder of this run that can be continued (paused / stopped / interrupted
+    with a checkpoint, or queued), or None."""
+    from .cleanup import resumable_runs
+    out = Path(cfg.output_dir)
+    if not out.exists():
+        return None
+    for r in resumable_runs(out):                       # newest first
+        if r["name"].startswith(f"{cfg.name}_") and r["name"][len(cfg.name) + 1:][:1].isdigit():
+            return Path(r["path"])
+    return None
+
+
 def run_grid(path: str | Path, only: Sequence[str] = (), dry_run: bool = False,
              resume: bool = True, extra: Optional[Sequence[str]] = None) -> List[str]:
-    from .experiment import Experiment
+    """Run every experiment of the grid. With ``resume`` (default) finished runs are skipped
+    and paused / interrupted ones continue from their checkpoint. Ctrl+C pauses the current
+    run after its round and stops the grid; run the same command again to continue."""
+    from .experiment import Experiment, run_pausable
 
     runs = [(n, c) for n, c in expand_grid(path, extra) if all(o in n for o in only)]
     done: List[str] = []
     for i, (name, cfg) in enumerate(runs, 1):
         skip = resume and _finished(cfg)
-        status = "skip (finished)" if skip else ("planned" if dry_run else "run")
+        cont = resumable_dir(cfg) if resume and not skip else None
+        status = ("skip (finished)" if skip else f"resume {cont.name}" if cont
+                  else ("planned" if dry_run else "run"))
         print(f"[grid {i}/{len(runs)}] {name}: {status}", flush=True)
         if skip or dry_run:
             continue
-        Experiment(cfg).run()
+        exp = Experiment.resume(cont) if cont else Experiment(cfg)
+        run_pausable(exp)
+        if exp.paused:
+            print(f"[grid] paused at {name}; run the same command again to continue.", flush=True)
+            break
         done.append(name)
     return done

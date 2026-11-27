@@ -96,6 +96,9 @@ class FedTriNet(Strategy):
     """FedTriNet: local / global / combined models vote by averaging softmax.
     See the module docstring."""
 
+    # each client's local model l^k is kept between the rounds it takes part in
+    persistent_state = ("_local_states",)
+
     needs_global_model = True
 
     def __init__(self, cfg, num_classes, pretrain_rounds: int = 20, alpha: float = 0.93,

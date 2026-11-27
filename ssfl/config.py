@@ -71,6 +71,9 @@ class ServerConfig:
     num_clients: int = 100
     client_fraction: float = 0.1        # C: fraction of clients sampled per round
     eval_every: int = 1
+    # save checkpoint.pt every k rounds, so a crashed / disconnected run can be resumed
+    # (python -m ssfl --resume RUN_DIR); 0 = only when paused. Pausing always saves one.
+    checkpoint_every: int = 25
     params: Dict[str, Any] = field(default_factory=dict)  # aggregator-specific kwargs
 
 

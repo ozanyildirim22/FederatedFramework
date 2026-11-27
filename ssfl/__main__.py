@@ -7,13 +7,18 @@
     python -m ssfl --grid configs/grids/thesis.yaml [--only organamnist] [--dry-run]
     python -m ssfl --config configs/cifar10_fedlabel.yaml --bench 5   # speed settings compared
     python -m ssfl --clear-runs [--runs-dir DIR] [--only TEXT] [--algorithm NAME] [--status unfinished] [--dry-run] [--yes]
+    python -m ssfl --resume runs/cifar10_fedlabel_20261127-150500 [--set server.rounds=1500]
+    python -m ssfl --list-resumable [--runs-dir DIR]
+
+Ctrl+C pauses a run after the current round and saves checkpoint.pt (Ctrl+C twice stops at once);
+--resume continues it from there.
 """
 from __future__ import annotations
 
 import argparse
 
 from . import AGGREGATORS, DATASETS, MODELS, PARTITIONERS, STRATEGIES
-from .experiment import Experiment
+from .experiment import Experiment, run_pausable
 
 
 def main(argv=None) -> None:
@@ -42,6 +47,11 @@ def main(argv=None) -> None:
     p.add_argument("--yes", "-y", action="store_true", help="with --clear-runs: do not ask")
     p.add_argument("--no-resume", action="store_true",
                    help="with --grid: also re-run experiments that already finished")
+    p.add_argument("--resume", metavar="RUN_DIR",
+                   help="continue a paused / stopped / interrupted run from its checkpoint.pt "
+                        "(--set may change e.g. server.rounds)")
+    p.add_argument("--list-resumable", action="store_true",
+                   help="list the runs in --runs-dir (default ./runs) that --resume can continue")
     p.add_argument("--bench", type=int, metavar="ROUNDS",
                    help="with --config: time ROUNDS rounds with and without channels_last, the cuDNN "
                         "benchmark and torch.compile; nothing is written to disk")
@@ -54,6 +64,17 @@ def main(argv=None) -> None:
     if args.gui:
         from .gui import launch
         launch(share=args.share, data_dir=args.data_dir, runs_dir=args.runs_dir, num_workers=args.workers)
+        return
+    if args.list_resumable:
+        from .cleanup import resumable_runs
+        rows = resumable_runs(args.runs_dir or "./runs")
+        if not rows:
+            print("No run to resume.")
+        for r in rows:
+            print(f"{r['status']:12s} round {r['rounds_done']}/{r['rounds_planned']}  {r['path']}")
+        return
+    if args.resume:
+        run_pausable(Experiment.resume(args.resume, args.set))
         return
     if args.clear_runs:
         from .cleanup import clear_runs_cli
@@ -71,7 +92,7 @@ def main(argv=None) -> None:
         from .bench import bench
         bench(args.config, args.bench, args.set)
         return
-    Experiment.from_yaml(args.config, args.set).run()
+    run_pausable(Experiment.from_yaml(args.config, args.set))
 
 
 if __name__ == "__main__":

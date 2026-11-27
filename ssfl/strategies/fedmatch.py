@@ -119,6 +119,9 @@ class FedMatch(Strategy):
     """FedMatch: inter-client consistency + disjoint (sigma/psi) learning.
     See the module docstring for the equations."""
 
+    # helper bank and client embeddings live on the server across rounds
+    persistent_state = ("_embeddings", "_recent", "_bank")
+
     def __init__(self, cfg, num_classes, tau: float = 0.85, lambda_s: float = 10.0,
                  lambda_iccs: float = 1e-2, lambda_l2: float = 10.0, lambda_l1: float = 1e-4,
                  num_helpers: int = 2, helper_every: int = 10, decompose: bool = True,
@@ -134,7 +137,7 @@ class FedMatch(Strategy):
         self.decompose = bool(decompose)
         self.reg_reduction = reg_reduction
         self.embed_samples = int(embed_samples)
-        # server-side state
+        # server-side state (kept in checkpoints: see Strategy.persistent_state)
         self._embeddings: Dict[int, torch.Tensor] = {}   # client id -> model embedding
         self._recent: Dict[int, StateDict] = {}          # models uploaded in the latest round
         self._bank: Dict[int, StateDict] = {}            # helper models currently on offer

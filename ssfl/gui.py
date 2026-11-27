@@ -183,13 +183,13 @@ FIELDS = [
     "strategy.grad_clip", "strategy.precision", "strategy.channels_last", "strategy.cudnn_benchmark",
     "strategy.compile",
     "server.aggregator", "server.rounds", "server.num_clients", "server.client_fraction",
-    "server.eval_every", "server.params",
+    "server.eval_every", "server.checkpoint_every", "server.params",
 ]
 JSON_FIELDS = {"model.params", "server.params"}
 INT_FIELDS = {"seed", "data.image_size", "data.batch_size", "data.unlabeled_batch_ratio",
               "data.num_workers", "data.randaugment_n", "data.randaugment_m",
               "strategy.local_epochs", "strategy.local_steps",
-              "server.rounds", "server.num_clients", "server.eval_every"}
+              "server.rounds", "server.num_clients", "server.eval_every", "server.checkpoint_every"}
 
 
 #: data.hflip in the form: None = auto (the dataset decides; off for OrganAMNIST)
@@ -415,16 +415,20 @@ class RunController:
         self.lock = threading.Lock()
         self.thread: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
+        self.pause_event = threading.Event()
         self._reset([], "experiment")
 
     def _reset(self, plan, kind: str) -> None:
+        """``plan``: ``(name, cfg, status)`` or ``(name, cfg, status, resume_dir)`` rows; a
+        row with ``resume_dir`` continues that run folder (:meth:`Experiment.resume`)."""
         self.kind = kind
-        self.plan = [{"name": n, "cfg": c, "status": s, "history": [], "best": None,
-                      "out_dir": None, "error": None, "started": None, "ended": None}
-                     for n, c, s in plan]
+        self.plan = [{"name": p[0], "cfg": p[1], "status": p[2], "history": [], "best": None,
+                      "out_dir": None, "error": None, "started": None, "ended": None,
+                      "resume": p[3] if len(p) > 3 else None}
+                     for p in plan]
         self.current = -1
         self.logs: List[str] = []
-        self.state = "idle"                 # idle | running | stopping | done | stopped | error
+        self.state = "idle"     # idle | running | stopping | pausing | done | stopped | paused | error
         self.message = "Ready."
         self.started = None
         self.version = 0
@@ -440,6 +444,7 @@ class RunController:
             self._reset(plan, kind)
             self.state, self.started = "running", time.time()
         self.stop_event.clear()
+        self.pause_event.clear()
         self.thread = threading.Thread(target=self._work, daemon=True)
         self.thread.start()
 
@@ -450,6 +455,18 @@ class RunController:
         with self.lock:
             self.state = "stopping"
             self.message = "Stopping after the current round …"
+            self.version += 1
+        return True
+
+    def pause(self) -> bool:
+        """Finish the current round, save a checkpoint and stop the queue; the paused run
+        and the ones still waiting can be continued with Resume."""
+        if not self.running or self.stop_event.is_set():
+            return False
+        self.pause_event.set()
+        with self.lock:
+            self.state = "pausing"
+            self.message = "Pausing after the current round (saving a checkpoint) …"
             self.version += 1
         return True
 
@@ -484,18 +501,30 @@ class RunController:
                     run["history"].append(dict(rec))
                     if "test_acc" in rec:
                         run["best"] = max(run["best"] or 0.0, rec["test_acc"])
-                    self.message = f"Training {run['name']}"
+                    if self.state == "running":
+                        self.message = f"Training {run['name']}"
                     self.version += 1
                 self._log(_fmt_round(rec))
                 if self.stop_event.is_set():
                     raise _Stopped()
+                if self.pause_event.is_set():
+                    exp.request_pause()         # the experiment saves a checkpoint and returns
 
             try:
-                exp = Experiment(run["cfg"], callbacks=[on_round], verbose=False)
+                if run.get("resume"):
+                    exp = Experiment.resume(run["resume"], callbacks=[on_round], verbose=False)
+                    if exp.resumed_from:
+                        self._log(f"⏯ resuming after round {exp.resumed_from} of {exp.cfg.server.rounds}")
+                else:
+                    exp = Experiment(run["cfg"], callbacks=[on_round], verbose=False)
                 with self.lock:
                     run["out_dir"] = str(exp.out_dir)
                     run["data_ready"] = True
-                    self.message = f"Training {run['name']}"
+                    run["history"] = [dict(r) for r in exp.history]      # earlier rounds of a resumed run
+                    accs = [r["test_acc"] for r in exp.history if "test_acc" in r]
+                    run["best"] = max(accs) if accs else None
+                    if self.state == "running":
+                        self.message = f"Training {run['name']}"
                     self.version += 1
                 self._log(exp.data.summary())
                 self._log(f"strategy={run['cfg'].strategy.name} aggregator={run['cfg'].server.aggregator} "
@@ -504,6 +533,9 @@ class RunController:
                           f"augment={run['cfg'].data.augment_device} precision={exp.server.precision} "
                           f"-> {exp.out_dir}")
                 exp.run()
+                if exp.paused:
+                    self._pause_queue(i, run)
+                    break
                 with self.lock:
                     run["status"], run["ended"] = "done", time.time()
                     self.version += 1
@@ -522,6 +554,8 @@ class RunController:
         with self.lock:
             if self.stop_event.is_set():
                 self.state, self.message = "stopped", "Stopped by user."
+            elif self.state == "paused":
+                pass
             elif errors:
                 self.state, self.message = "error", f"Finished with {errors} failed run(s) - see the log."
             else:
@@ -530,6 +564,32 @@ class RunController:
                 if run["status"] == "queued":
                     run["status"] = "cancelled"
             self.version += 1
+
+    def _pause_queue(self, i: int, run: Dict[str, Any]) -> None:
+        """After the run at ``i`` paused: the runs still waiting get a ``queued`` run folder
+        (experiment queue), so Resume continues them too; a grid finds them again itself."""
+        from .experiment import write_queued_run
+        waiting = [r for r in self.plan[i + 1:] if r["status"] == "queued"]
+        for r in waiting:
+            if self.kind == "experiment":
+                if r.get("resume"):                     # already has its (queued) folder
+                    r["out_dir"] = r["resume"]
+                else:
+                    try:
+                        r["out_dir"] = str(write_queued_run(r["cfg"]))
+                    except OSError as e:
+                        self._log(f"could not save the queued run {r['name']}: {e}")
+            r["status"] = "waiting"
+        with self.lock:
+            run["status"], run["ended"] = "paused", time.time()
+            self.state = "paused"
+            self.message = (f"Paused after round {len(run['history'])}/{run['cfg'].server.rounds} — "
+                            + ("press ⏯ Resume to continue" if self.kind == "experiment"
+                               else "run the grid again to continue"))
+            self.version += 1
+        self._log(f"⏸ {run['name']} paused after round {len(run['history'])} (checkpoint saved)"
+                  + (f"; {len(waiting)} queued run(s) saved for Resume" if waiting and self.kind == "experiment"
+                     else ""))
 
     def snapshot(self) -> Dict[str, Any]:
         with self.lock:
@@ -553,12 +613,12 @@ def _fmt_round(rec: Dict[str, float]) -> str:
 
 # ------------------------------------------------------- HTML renderers
 STATUS_ICON = {"queued": "⏳", "running": "▶", "done": "✓", "stopped": "■", "error": "✗",
-               "cancelled": "–", "finished": "✓"}
+               "cancelled": "–", "finished": "✓", "paused": "⏸", "waiting": "⏸"}
 
 
 def _eta(snap) -> Optional[float]:
     plan, cur = snap["plan"], snap["current"]
-    if cur < 0 or snap["state"] not in ("running", "stopping"):
+    if cur < 0 or snap["state"] not in ("running", "stopping", "pausing"):
         return None
     run = plan[cur]
     times = [r.get("time_s", 0) for r in run["history"][-5:]]
@@ -581,8 +641,8 @@ def render_status(snap) -> str:
     total_rounds = sum(r["cfg"].server.rounds for r in active) or 1
     done_rounds = sum(r["cfg"].server.rounds if r["status"] == "done" else len(r["history"]) for r in active)
     pct = 100.0 * done_rounds / total_rounds
-    label = {"running": "Running", "stopping": "Stopping", "done": "Finished", "stopped": "Stopped",
-             "error": "Finished with errors", "idle": "Ready"}[state]
+    label = {"running": "Running", "stopping": "Stopping", "pausing": "Pausing", "paused": "Paused",
+             "done": "Finished", "stopped": "Stopped", "error": "Finished with errors", "idle": "Ready"}[state]
     head = f'<span class="dot"></span><b>{label}</b>'
     if 0 <= cur < len(plan):
         r = plan[cur]
@@ -597,16 +657,16 @@ def render_status(snap) -> str:
             foot.append(f"downloaded {mb:.1f} MB")
     if 0 <= cur < len(plan) and (plan[cur]["history"] or plan[cur].get("data_ready")):
         done, total = len(plan[cur]["history"]), plan[cur]["cfg"].server.rounds
-        if state in ("running", "stopping") and plan[cur]["status"] == "running" and done < total:
+        if state in ("running", "stopping", "pausing") and plan[cur]["status"] == "running" and done < total:
             foot.append(f"round {done + 1}/{total} in progress")
         else:
             foot.append(f"round {done}/{total}")
     if snap["started"]:
-        foot.append(f"elapsed {_fmt_secs(time.time() - snap['started'])}" if state in ("running", "stopping")
-                    else "")
+        foot.append(f"elapsed {_fmt_secs(time.time() - snap['started'])}"
+                    if state in ("running", "stopping", "pausing") else "")
     if eta is not None:
         foot.append(f"ETA {_fmt_secs(eta)}")
-    if state in ("running", "stopping"):
+    if state in ("running", "stopping", "pausing"):
         foot.append(gpu_usage())
     chips = ""
     if 1 < len(active) and snap["kind"] == "experiment":     # the grid tab has its own table
@@ -862,8 +922,20 @@ def _status(meta: Dict[str, Any]) -> str:
     return st
 
 
-STATUS_LABEL = {"finished": "✓ finished", "running": "▶ running", "stopped": "■ stopped",
+STATUS_LABEL = {"finished": "✓ finished", "running": "▶ running", "paused": "⏸ paused",
+                "queued": "⏳ queued (not started)", "stopped": "■ stopped",
                 "error": "✗ error", "interrupted": "⚠ interrupted", "partial": "… partial"}
+
+
+def run_start_key(run_dir: Path) -> Tuple[str, float]:
+    """Sort key = when the run folder was created (the ``_YYYYMMDD-HHMMSS`` stamp in its name).
+    A paused queue then resumes in its original order: the paused run started before the
+    queued runs' folders were written."""
+    m = re.search(r"_(\d{8}-\d{6})(?:-(\d+))?$", run_dir.name)
+    if m:
+        return (m.group(1), float(m.group(2) or 0))
+    from .cleanup import _mtime
+    return (time.strftime("%Y%m%d-%H%M%S", time.localtime(_mtime(run_dir))), 0.0)
 
 
 def scan_runs(runs_dir: str) -> List[Dict[str, Any]]:
@@ -1401,8 +1473,10 @@ footer { display:none !important; }
   background: var(--block-background-fill); }
 .status-head { display:flex; align-items:center; gap:4px; font-size:15px; flex-wrap:wrap; }
 .status .dot { width:10px; height:10px; border-radius:50%; background:#94a3b8; margin-right:8px; }
-.status-running .dot, .status-stopping .dot { background:var(--ss-a); animation: pulse 1.4s infinite; }
+.status-running .dot, .status-stopping .dot, .status-pausing .dot { background:var(--ss-a); animation: pulse 1.4s infinite; }
 .status-done .dot { background:var(--ss-ok); } .status-stopped .dot { background:var(--ss-warn); }
+.status-paused .dot { background:#f59e0b; }
+.status-paused .bar > div { background: linear-gradient(90deg, #f59e0b, #fbbf24); animation:none; }
 .status-error .dot { background:var(--ss-err); }
 @keyframes pulse { 0% { box-shadow:0 0 0 0 rgba(99,102,241,.6);} 70% { box-shadow:0 0 0 10px rgba(99,102,241,0);}
   100% { box-shadow:0 0 0 0 rgba(99,102,241,0);} }
@@ -1420,6 +1494,7 @@ footer { display:none !important; }
 .q-done { border-color:var(--ss-ok); color:#059669; background:rgba(16,185,129,.08); }
 .q-error { border-color:var(--ss-err); color:var(--ss-err); }
 .q-stopped, .q-cancelled { opacity:.6; }
+.q-paused, .q-waiting { border-color:#f59e0b; color:#b45309; background:rgba(245,158,11,.08); }
 
 /* KPI cards */
 .kpi-grid { display:grid; grid-template-columns: repeat(5, minmax(0,1fr)); gap:10px; }
@@ -1666,6 +1741,10 @@ def build_app():
                                                          label="Aggregator")
                                 eval_every = gr.Number(v["server.eval_every"], precision=0,
                                                        label="Evaluate every k rounds")
+                                checkpoint_every = gr.Number(
+                                    v["server.checkpoint_every"], precision=0,
+                                    label="Checkpoint every k rounds",
+                                    info="lets ⏯ Resume continue after a crash / disconnect; 0 = only on ⏸ Pause")
                             server_params = gr.Code(v["server.params"], language="json",
                                                     label="Aggregator parameters (JSON)", lines=2)
                             with gr.Row():
@@ -1680,10 +1759,23 @@ def build_app():
                     with gr.Column(scale=7, min_width=480):
                         with gr.Row():
                             run_btn = gr.Button("🚀  Launch", variant="primary", elem_classes="launch", scale=3)
+                            pause_btn = gr.Button("⏸  Pause", scale=1)
+                            resume_btn = gr.Button("⏯  Resume", scale=1)
                             stop_btn = gr.Button("■  Stop", variant="stop", scale=1)
                             preview_btn = gr.Button("🧩  Preview split", scale=1)
                             speed_btn = gr.Button("⏱️  Speed check", scale=1)
                             save_btn = gr.Button("💾  Save preset", scale=1)
+                        with gr.Group(visible=False) as resume_box:
+                            gr.Markdown("**Resume** — paused runs continue after their last saved round "
+                                        "(checkpoint); queued runs that never started begin at round 1. "
+                                        "Stopped or interrupted runs with a checkpoint can be picked too "
+                                        "(rounds after their last checkpoint are trained again).",
+                                        elem_classes="clear-note")
+                            resume_pick = gr.Dropdown([], value=[], multiselect=True,
+                                                      label="Runs to continue (in this order: oldest first)")
+                            with gr.Row():
+                                resume_go = gr.Button("▶  Resume selected", variant="primary", scale=2)
+                                resume_cancel = gr.Button("Cancel", scale=1)
                         notice = gr.Markdown("", visible=False)
                         status = gr.HTML(render_status(ctrl.snapshot()))
                         kpis = gr.HTML(render_kpis(ctrl.snapshot()))
@@ -1750,6 +1842,7 @@ def build_app():
                 with gr.Row():
                     grid_preview_btn = gr.Button("🔍  Preview runs", scale=1)
                     grid_run_btn = gr.Button("🚀  Run grid", variant="primary", elem_classes="launch", scale=2)
+                    grid_pause_btn = gr.Button("⏸  Pause", scale=1)
                     grid_stop_btn = gr.Button("■  Stop", variant="stop", scale=1)
                 grid_status = gr.HTML(render_status(ctrl.snapshot()))
                 grid_table = gr.Dataframe(pd.DataFrame(), label="Runs", wrap=True, max_height=420)
@@ -1841,7 +1934,8 @@ def build_app():
                       model_name, norm, model_params,
                       local_epochs, local_steps, optimizer, lr, momentum, weight_decay,
                       prox_mu, grad_clip, precision, channels_last, cudnn_benchmark, compile_,
-                      aggregator, rounds, num_clients, client_fraction, eval_every, server_params]
+                      aggregator, rounds, num_clients, client_fraction, eval_every, checkpoint_every,
+                      server_params]
         assert len(components) == len(FIELDS)
         cfg_inputs = components + [algos, params_state]
 
@@ -2075,6 +2169,65 @@ def build_app():
 
         stop_btn.click(on_stop, None, notice)
 
+        # ------------------------------------------------------ pause / resume
+        def on_pause():
+            if ctrl.pause():
+                return gr.update(value="⏸ Pausing after the current round — a checkpoint is saved, "
+                                       "then **⏯ Resume** continues from there.", visible=True)
+            if ctrl.running:
+                return gr.update(value="Already stopping.", visible=True)
+            return gr.update(value="Nothing is running.", visible=True)
+
+        pause_btn.click(on_pause, None, notice)
+        grid_pause_btn.click(lambda: ctrl.pause() and None, None, None)
+
+        def resume_rows(d):
+            from .cleanup import resumable_runs
+            return resumable_runs(d)
+
+        def on_resume_open(d):
+            rows = resume_rows(d)
+            if not rows:
+                return (gr.update(value=f"No run to resume in `{d}` (paused runs, queued runs and runs "
+                                        f"with a checkpoint are listed).", visible=True),
+                        gr.update(visible=False), gr.update())
+            choices = [(f"{STATUS_LABEL.get(r['status'], r['status'])} · {r['name']} · "
+                        f"round {r['rounds_done']}/{r['rounds_planned'] or '?'}", r["path"]) for r in rows]
+            preset = [r["path"] for r in rows if r["status"] in ("paused", "queued")]
+            return (gr.update(visible=False), gr.update(visible=True),
+                    gr.update(choices=choices, value=preset))
+
+        resume_btn.click(on_resume_open, [output_dir], [notice, resume_box, resume_pick])
+        resume_cancel.click(lambda: gr.update(visible=False), None, resume_box)
+
+        def on_resume_go(paths):
+            if ctrl.running or speed.running:
+                yield (warn("A job or speed check is already running — stop it first."), gr.update(),
+                       gr.update(), *[gr.update()] * 7)
+                return
+            if not paths:
+                yield (warn("Pick at least one run to resume."), gr.update(), gr.update(),
+                       *[gr.update()] * 7)
+                return
+            plan = []
+            for p in sorted((Path(p) for p in paths), key=run_start_key):   # paused run first, then its queue
+                try:
+                    cfg = ExperimentConfig.from_yaml(p / "config.yaml")
+                except Exception as e:  # noqa: BLE001
+                    yield (warn(f"{p.name}: {e}"), gr.update(), gr.update(), *[gr.update()] * 7)
+                    return
+                plan.append((cfg.name, cfg, "queued", str(p)))
+            ctrl.start(plan, "experiment")
+            first = True
+            for out in stream(exp_view, "experiment"):
+                yield (gr.update(visible=False) if first else gr.update(),
+                       gr.Tabs(selected="charts") if first else gr.update(),
+                       gr.update(visible=False) if first else gr.update(), *out)
+                first = False
+
+        resume_go.click(on_resume_go, [resume_pick], [notice, dash_tabs, resume_box] + exp_outputs,
+                        show_progress="hidden")
+
         def on_speed(*vals):
             if ctrl.running or speed.running:
                 yield warn("A job or speed check is already running — stop it first."), gr.update(), \
@@ -2111,14 +2264,23 @@ def build_app():
 
         # --------------------------------------------------------------- grid
         def grid_plan(path, only, extra, skip):
-            from .grid import _finished, expand_grid
+            """Rows for the run queue; with "skip finished" a paused / interrupted run that has
+            a checkpoint continues from it instead of starting again."""
+            from .grid import _finished, expand_grid, resumable_dir
             if not path:
                 raise ValueError("No grid file selected.")
             runs = expand_grid(PROJECT_ROOT / path if not Path(path).exists() else path,
                                (extra or "").split())
             words = (only or "").split()
             runs = [(n, c) for n, c in runs if all(w in n for w in words)]
-            return [(n, c, "finished" if skip and _finished(c) else "queued") for n, c in runs]
+            plan = []
+            for n, c in runs:
+                if skip and _finished(c):
+                    plan.append((n, c, "finished"))
+                    continue
+                cont = resumable_dir(c) if skip else None
+                plan.append((n, c, "queued", str(cont)) if cont else (n, c, "queued"))
+            return plan
 
         def grid_frame(plan_rows) -> pd.DataFrame:
             return pd.DataFrame([{
@@ -2143,9 +2305,9 @@ def build_app():
             except Exception as e:  # noqa: BLE001
                 return (f'<div class="status status-error"><div class="status-head"><span class="dot"></span>'
                         f'<b>{html.escape(str(e))}</b></div></div>', gr.update())
-            rows = [{"name": n, "cfg": c, "status": s, "history": [], "best": None} for n, c, s in plan]
-            todo = sum(s == "queued" for *_, s in plan)
-            rounds = sum(c.server.rounds for _, c, s in plan if s == "queued")
+            rows = [{"name": p[0], "cfg": p[1], "status": p[2], "history": [], "best": None} for p in plan]
+            todo = sum(p[2] == "queued" for p in plan)
+            rounds = sum(p[1].server.rounds for p in plan if p[2] == "queued")
             msg = (f'<div class="status status-idle"><div class="status-head"><span class="dot"></span>'
                    f'<b>{len(plan)} runs</b><span class="muted">{todo} to run · {len(plan) - todo} finished · '
                    f'{rounds:,} rounds in total</span></div></div>')

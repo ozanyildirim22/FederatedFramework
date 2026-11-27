@@ -6,7 +6,7 @@ never deleted. Used by ``python -m ssfl --clear-runs`` and the GUI's Results tab
 
     python -m ssfl --clear-runs --dry-run                      # list every run folder
     python -m ssfl --clear-runs --algorithm fedlabel           # all FedLabel runs (asks first)
-    python -m ssfl --clear-runs --status unfinished --yes      # stopped / error / interrupted / partial
+    python -m ssfl --clear-runs --status unfinished --yes      # paused / queued / stopped / error / interrupted / partial
     python -m ssfl --clear-runs --runs-dir /content/drive/MyDrive/ssfl/runs --only organamnist
 """
 from __future__ import annotations
@@ -26,7 +26,9 @@ import yaml
 RUN_FILES = ("config.yaml", "metrics.csv", "summary.json")
 #: a "running" run that has not written anything for this long is treated as interrupted
 STALE_S = 600
-STATUSES = ("finished", "running", "stopped", "error", "interrupted", "partial")
+STATUSES = ("finished", "running", "paused", "queued", "stopped", "error", "interrupted", "partial")
+#: statuses ``unfinished`` stands for
+UNFINISHED = ("paused", "queued", "stopped", "error", "interrupted", "partial")
 
 
 def is_run_dir(path: Path) -> bool:
@@ -47,7 +49,8 @@ def _mtime(run_dir: Path) -> float:
 
 
 def run_status(run_dir: Path) -> str:
-    """finished | running | stopped | error | interrupted | partial (no summary.json)."""
+    """finished | running | paused | queued | stopped | error | interrupted | partial
+    (no summary.json)."""
     try:
         summ = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -58,6 +61,35 @@ def run_status(run_dir: Path) -> str:
         if time.time() - _mtime(run_dir) > max(STALE_S, 5 * per_round):
             return "interrupted"
     return st
+
+
+def checkpoint_round(run_dir: Path) -> Optional[int]:
+    """Last round saved in the run's checkpoint (None without one)."""
+    from .experiment import CHECKPOINT, CHECKPOINT_INFO
+    if not (run_dir / CHECKPOINT).exists():
+        return None
+    try:
+        return int(json.loads((run_dir / CHECKPOINT_INFO).read_text(encoding="utf-8"))["round"])
+    except (OSError, ValueError, KeyError):
+        return -1                                   # checkpoint without its info file: round unknown
+
+
+def resumable_runs(runs_dir: str | Path) -> List[Dict[str, object]]:
+    """Run folders that ``Experiment.resume`` can continue, newest first: paused, stopped,
+    errored or interrupted runs with a checkpoint, and queued runs (never started)."""
+    out = []
+    for p in list_run_dirs(runs_dir):
+        st = run_status(p)
+        ck = checkpoint_round(p)
+        if st == "queued" or (ck is not None and st in ("paused", "stopped", "error", "interrupted")):
+            try:
+                summ = json.loads((p / "summary.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                summ = {}
+            out.append({"path": str(p), "name": p.name, "status": st,
+                        "rounds_done": max(ck or 0, 0), "rounds_planned": summ.get("rounds_planned"),
+                        "algorithm": run_algorithm(p)})
+    return out
 
 
 def run_algorithm(run_dir: Path) -> Optional[str]:
@@ -75,7 +107,7 @@ def select_runs(runs_dir: str | Path, only: Sequence[str] = (), algorithms: Sequ
     ``unfinished`` in ``statuses`` stands for every status except finished and running."""
     wanted = set(statuses)
     if "unfinished" in wanted:
-        wanted |= {"stopped", "error", "interrupted", "partial"}
+        wanted |= set(UNFINISHED)
         wanted.discard("unfinished")
     unknown = wanted - set(STATUSES)
     if unknown:

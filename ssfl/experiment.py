@@ -1,10 +1,20 @@
-"""Experiment: wires the three tiers together and runs the federated loop."""
+"""Experiment: wires the three tiers together and runs the federated loop.
+
+Pause / resume: :meth:`Experiment.request_pause` stops a run after the current round and
+writes ``checkpoint.pt`` into the run folder (also every ``server.checkpoint_every`` rounds,
+so a crashed or disconnected run can be picked up too). :meth:`Experiment.resume` rebuilds
+the run from its folder and continues with the next round, in the same folder::
+
+    exp = Experiment.resume("runs/cifar10_fedlabel_20261127-150500")
+    exp.run()                      # rounds k+1 ... R; metrics.csv keeps the earlier rounds
+"""
 from __future__ import annotations
 
 import copy
 import csv
 import json
 import random
+import signal
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -23,12 +33,85 @@ from .server import Server
 
 Callback = Callable[[int, Dict[str, float], "Experiment"], None]
 
+#: file in the run folder that holds everything needed to continue a run
+CHECKPOINT = "checkpoint.pt"
+CHECKPOINT_INFO = "checkpoint.json"
+CHECKPOINT_VERSION = 1
+#: config entries that may differ when a run is resumed (where and how long it runs,
+#: not what it trains)
+RESUME_FREE_KEYS = ("name", "output_dir", "device", "server.rounds", "server.eval_every",
+                    "server.checkpoint_every", "data.root", "data.num_workers")
+
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def rng_state() -> Dict[str, object]:
+    """Every global random generator the run draws from (client sampling has its own)."""
+    st = {"python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state()}
+    if torch.cuda.is_available():
+        st["cuda"] = torch.cuda.get_rng_state_all()
+    return st
+
+
+def set_rng_state(st: Dict[str, object]) -> None:
+    random.setstate(st["python"])
+    np.random.set_state(st["numpy"])
+    torch.set_rng_state(st["torch"])
+    if "cuda" in st and torch.cuda.is_available():
+        cuda = st["cuda"]
+        if len(cuda) == torch.cuda.device_count():
+            torch.cuda.set_rng_state_all(cuda)
+        else:                                       # resumed on a machine with other GPUs
+            torch.cuda.set_rng_state(cuda[0])
+
+
+def _flat(d: Dict, prefix: str = "") -> Dict[str, object]:
+    out = {}
+    for k, v in d.items():
+        if isinstance(v, dict) and k != "params":
+            out.update(_flat(v, f"{prefix}{k}."))
+        else:
+            out[f"{prefix}{k}"] = v
+    return out
+
+
+def new_run_dir(cfg: ExperimentConfig) -> Path:
+    """``<output_dir>/<name>_<timestamp>`` that does not exist yet."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    out = Path(cfg.output_dir) / f"{cfg.name}_{stamp}"
+    n = 2
+    while out.exists():                     # same name started within the same second
+        out = Path(cfg.output_dir) / f"{cfg.name}_{stamp}-{n}"
+        n += 1
+    return out
+
+
+def resolved_config(cfg: ExperimentConfig) -> ExperimentConfig:
+    """The config with every strategy / aggregator parameter written out, defaults
+    included, so ``config.yaml`` alone reproduces the run."""
+    cfg = copy.deepcopy(cfg)
+    cfg.strategy.params = full_params(STRATEGIES.get(cfg.strategy.name), cfg.strategy.params)
+    cfg.server.params = full_params(AGGREGATORS.get(cfg.server.aggregator), cfg.server.params)
+    return cfg
+
+
+def write_queued_run(cfg: ExperimentConfig) -> Path:
+    """A run folder for a run that has not started yet (``config.yaml`` and a ``queued``
+    summary), e.g. the runs still waiting when a queue is paused. Resuming it starts the
+    run from round 1 in that folder."""
+    out = new_run_dir(cfg)
+    out.mkdir(parents=True)
+    resolved_config(cfg).save(out / "config.yaml")
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    (out / "summary.json").write_text(json.dumps({
+        "name": cfg.name, "status": "queued", "started_at": None, "updated_at": now,
+        "rounds_done": 0, "rounds_planned": cfg.server.rounds}, indent=2))
+    return out
 
 
 def resolve_device(name: str) -> torch.device:
@@ -45,7 +128,9 @@ class Experiment:
     """
 
     def __init__(self, cfg: ExperimentConfig, callbacks: Optional[List[Callback]] = None,
-                 verbose: bool = True):
+                 verbose: bool = True, out_dir: Optional[str | Path] = None):
+        """``out_dir``: write into this run folder instead of a new ``<name>_<timestamp>``
+        (used by :meth:`resume`)."""
         t_setup = time.time()
         self.cfg = cfg
         self.callbacks = list(callbacks or [])
@@ -78,16 +163,105 @@ class Experiment:
         self.history: List[Dict[str, float]] = []
         self.setup_s = time.time() - t_setup           # data loading, partitioning, model building
 
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        self.out_dir = Path(cfg.output_dir) / f"{cfg.name}_{stamp}"
-        n = 2
-        while self.out_dir.exists():           # same name started within the same second
-            self.out_dir = Path(cfg.output_dir) / f"{cfg.name}_{stamp}-{n}"
-            n += 1
+        self.out_dir = Path(out_dir) if out_dir is not None else new_run_dir(cfg)
+        # pause / resume
+        self.pause_requested = False           # set by request_pause(); checked after each round
+        self.paused = False                    # True once run() returned because of a pause
+        self.resumed_from = 0                  # rounds restored from a checkpoint
+        self._started_at: Optional[float] = None
+        self._elapsed_before = 0.0             # wall time of the earlier sessions of this run
+        self._resumes = 0
 
     @classmethod
     def from_yaml(cls, path, overrides=None, **kw) -> "Experiment":
         return cls(ExperimentConfig.from_yaml(path, overrides), **kw)
+
+    # -------------------------------------------------------- pause / resume
+    def request_pause(self) -> None:
+        """Finish the current round, save a checkpoint and return from :meth:`run`
+        (thread-safe: it only sets a flag)."""
+        self.pause_requested = True
+
+    @classmethod
+    def resume(cls, run_dir: str | Path, overrides=None, **kw) -> "Experiment":
+        """Rebuild a paused, stopped or interrupted run from its folder; :meth:`run` then
+        continues with the round after the last checkpoint, in the same folder.
+        ``overrides`` may change where / how long it runs (e.g. ``server.rounds=1500``);
+        changing what it trains is allowed but logged as a warning. A ``queued`` run
+        (never started) starts from round 1."""
+        run_dir = Path(run_dir)
+        if not (run_dir / "config.yaml").exists():
+            raise FileNotFoundError(f"{run_dir} is not a run folder (no config.yaml)")
+        cfg = ExperimentConfig.from_yaml(run_dir / "config.yaml", overrides)
+        cfg.output_dir = str(run_dir.parent)
+        ckpt = run_dir / CHECKPOINT
+        status = None
+        try:
+            status = json.loads((run_dir / "summary.json").read_text()).get("status")
+        except (OSError, ValueError):
+            pass
+        if not ckpt.exists() and status != "queued":
+            if status == "finished":
+                raise ValueError(f"{run_dir.name} has already finished")
+            raise FileNotFoundError(
+                f"{run_dir.name} has no {CHECKPOINT}: it stopped before its first checkpoint "
+                f"(every server.checkpoint_every rounds, or on pause), so it can only be started again")
+        exp = cls(cfg, out_dir=run_dir, **kw)
+        if ckpt.exists():
+            exp.load_checkpoint(ckpt)
+        return exp
+
+    def save_checkpoint(self) -> Path:
+        """Everything needed to continue after the last finished round: global model,
+        history, client-sampling and global random states, aggregator and strategy state."""
+        state = {
+            "version": CHECKPOINT_VERSION,
+            "round": len(self.history),
+            "global_state": self.server.global_state,
+            "history": self.history,
+            "server_rng": self.server.rng.bit_generator.state,
+            "aggregator": self.server.aggregator.state_dict(),
+            "strategy": self.strategy.state_dict(),
+            "rng": rng_state(),
+            "started_at": self._started_at,
+            "elapsed_s": self._elapsed(),
+            "resumes": self._resumes,
+            "config": resolved_config(self.cfg).to_dict(),
+        }
+        path = self.out_dir / CHECKPOINT
+        tmp = path.with_suffix(".pt.tmp")
+        torch.save(state, tmp)
+        tmp.replace(path)                       # never a half-written checkpoint
+        # small sidecar, so run lists can show the checkpoint's round without loading it
+        (self.out_dir / CHECKPOINT_INFO).write_text(json.dumps({
+            "round": len(self.history), "rounds_planned": self.cfg.server.rounds,
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}))
+        return path
+
+    def load_checkpoint(self, path: str | Path) -> None:
+        ck = torch.load(path, map_location="cpu", weights_only=False)
+        if ck.get("version") != CHECKPOINT_VERSION:
+            raise ValueError(f"{path}: unsupported checkpoint version {ck.get('version')}")
+        old, new = _flat(ck.get("config", {})), _flat(resolved_config(self.cfg).to_dict())
+        changed = [k for k in sorted(set(old) | set(new))
+                   if old.get(k) != new.get(k) and not any(k == f or k.startswith(f + ".")
+                                                           for f in RESUME_FREE_KEYS)]
+        if changed:
+            self.log(f"[ssfl] warning: resuming with a different config for "
+                     f"{', '.join(f'{k} ({old.get(k)!r} -> {new.get(k)!r})' for k in changed)}")
+        self.server.global_state = ck["global_state"]
+        self.server.rng.bit_generator.state = ck["server_rng"]
+        self.server.aggregator.load_state_dict(ck["aggregator"])
+        self.strategy.load_state_dict(ck["strategy"])
+        self.history = list(ck["history"])
+        self.resumed_from = int(ck["round"])
+        self._started_at = ck.get("started_at")
+        self._elapsed_before = float(ck.get("elapsed_s") or 0.0)
+        self._resumes = int(ck.get("resumes", 0)) + 1
+        set_rng_state(ck["rng"])                # last: nothing else may draw from them now
+
+    def _elapsed(self) -> float:
+        return self._elapsed_before + (time.time() - self._t_start) + self.setup_s
 
     def log(self, msg: str) -> None:
         if self.verbose:
@@ -131,10 +305,7 @@ class Experiment:
     def resolved_config(self) -> ExperimentConfig:
         """The config with every strategy / aggregator parameter written out, defaults
         included, so ``config.yaml`` alone reproduces the run."""
-        cfg = copy.deepcopy(self.cfg)
-        cfg.strategy.params = full_params(STRATEGIES.get(cfg.strategy.name), cfg.strategy.params)
-        cfg.server.params = full_params(AGGREGATORS.get(cfg.server.aggregator), cfg.server.params)
-        return cfg
+        return resolved_config(self.cfg)
 
     def _write_summary(self, status: str) -> None:
         """``summary.json``: status, timing, best / final metrics and environment. Written
@@ -151,14 +322,14 @@ class Experiment:
             return round(float(np.mean(v)), 4) if v else None
         summary = {
             "name": self.cfg.name,
-            "status": status,                         # running | finished | stopped | error
-            "started_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self._t_start)),
+            "status": status,                         # running | paused | finished | stopped | error
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self._started_at)),
             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
             "rounds_done": len(self.history),
             "rounds_planned": self.cfg.server.rounds,
             "setup_s": round(self.setup_s, 2),
             "train_s": round(sum(times), 2),
-            "elapsed_s": round(now - self._t_start + self.setup_s, 2),
+            "elapsed_s": round(self._elapsed(), 2),   # wall time, pauses not counted
             "mean_round_s": round(sum(times) / len(times), 3) if times else None,
             "best_test_acc": best[0],
             "best_round": best[1],
@@ -176,6 +347,8 @@ class Experiment:
             "hflip": self.data.hflip,                 # resolved (auto = off for OrganAMNIST)
             "data_summary": self.data.summary(),
             "environment": self._env,
+            "resumes": self._resumes,                 # times this run was continued from a checkpoint
+            "checkpoint": (self.out_dir / CHECKPOINT).exists(),
         }
         tmp = self.out_dir / "summary.json.tmp"
         tmp.write_text(json.dumps(summary, indent=2))
@@ -185,6 +358,9 @@ class Experiment:
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.resolved_config().save(self.out_dir / "config.yaml")
         self._t_start = time.time()
+        if self._started_at is None:
+            self._started_at = self._t_start
+        self.paused = False
         self._env = environment(self.device)
         try:
             return self._run()
@@ -201,8 +377,12 @@ class Experiment:
                  f"workers={self.num_workers}{' (auto)' if self.cfg.data.num_workers < 0 else ''} "
                  f"augment={self.cfg.data.augment_device} precision={self.server.precision} "
                  f"-> {self.out_dir}")
+        if self.resumed_from:
+            self.log(f"[ssfl] resumed after round {self.resumed_from} of {self.cfg.server.rounds}")
 
-        for rnd in range(1, self.cfg.server.rounds + 1):
+        rounds = self.cfg.server.rounds
+        every = int(getattr(self.cfg.server, "checkpoint_every", 0) or 0)
+        for rnd in range(len(self.history) + 1, rounds + 1):
             rec = self.run_round(rnd)
             self.history.append(rec)
             self._write_csv()
@@ -218,9 +398,19 @@ class Experiment:
             self.log(msg + f" | {rec['time_s']:.1f}s")
             self._write_summary("running")
             for cb in self.callbacks:
-                cb(rnd, rec, self)
+                cb(rnd, rec, self)              # may call request_pause() (GUI) or raise (stop)
+            if rnd < rounds and (self.pause_requested or (every and rnd % every == 0)):
+                self.save_checkpoint()
+            if self.pause_requested and rnd < rounds:
+                self.paused = True
+                self._write_summary("paused")
+                self.log(f"[ssfl] paused after round {rnd}/{rounds}; continue with "
+                         f"python -m ssfl --resume \"{self.out_dir}\"")
+                return self.history
 
         torch.save(self.server.global_state, self.out_dir / "global_model.pt")
+        for f in (CHECKPOINT, CHECKPOINT_INFO):         # finished: global_model.pt is enough
+            (self.out_dir / f).unlink(missing_ok=True)
         self._write_summary("finished")
         best = max((r["test_acc"] for r in self.history if "test_acc" in r), default=None)
         msg = f"[ssfl] done. best test_acc={best}"
@@ -237,3 +427,22 @@ class Experiment:
             w = csv.DictWriter(f, fieldnames=keys)
             w.writeheader()
             w.writerows(self.history)
+
+
+def run_pausable(exp: "Experiment") -> List[Dict[str, float]]:
+    """Run with Ctrl+C = pause after the current round (checkpoint saved), Ctrl+C again = stop now."""
+    def on_sigint(signum, frame):
+        if exp.pause_requested:
+            raise KeyboardInterrupt
+        exp.request_pause()
+        print("\n[ssfl] pausing after the current round (Ctrl+C again to stop now) ...", flush=True)
+
+    try:
+        old = signal.signal(signal.SIGINT, on_sigint)
+    except ValueError:                      # not the main thread: plain run
+        return exp.run()
+    try:
+        return exp.run()
+    finally:
+        signal.signal(signal.SIGINT, old)
+

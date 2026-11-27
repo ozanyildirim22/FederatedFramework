@@ -19,6 +19,9 @@ StateDict = Dict[str, torch.Tensor]
 
 
 class Aggregator:
+    #: attributes carried from round to round (server momentum etc.), saved in checkpoints
+    persistent_state: tuple = ()
+
     def __init__(self, weight_by: str = "num_samples", server_lr: float = 1.0):
         if weight_by not in ("num_samples", "num_labeled", "uniform"):
             raise ValueError(f"Unknown weight_by '{weight_by}'")
@@ -33,6 +36,14 @@ class Aggregator:
             if w.sum() == 0:
                 w = torch.ones(len(updates))
         return w / w.sum()
+
+    def state_dict(self) -> Dict[str, object]:
+        return {k: getattr(self, k) for k in self.persistent_state}
+
+    def load_state_dict(self, state: Dict[str, object]) -> None:
+        for k in self.persistent_state:
+            if k in state:
+                setattr(self, k, state[k])
 
     def combine(self, key: str, deltas: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
         """``deltas``: (num_clients, *shape). Return the step for this tensor."""
@@ -68,6 +79,8 @@ class FedAvg(Aggregator):
 class FedAvgM(Aggregator):
     """Hsu et al., 2019 - FedAvg with server-side momentum."""
 
+    persistent_state = ("v",)
+
     def __init__(self, beta: float = 0.9, **kw):
         super().__init__(**kw)
         self.beta, self.v = beta, {}
@@ -81,6 +94,8 @@ class FedAvgM(Aggregator):
 @AGGREGATORS.register("fedadam")
 class FedAdam(Aggregator):
     """Reddi et al., 2021 (Adaptive Federated Optimization) - server Adam."""
+
+    persistent_state = ("m", "v")
 
     def __init__(self, server_lr: float = 0.01, beta1: float = 0.9, beta2: float = 0.99,
                  tau: float = 1e-3, **kw):

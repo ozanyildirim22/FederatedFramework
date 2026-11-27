@@ -123,6 +123,20 @@ class Strategy:
     def on_round_end(self, model: nn.Module, client) -> None:
         """Called after local training, before the update is sent."""
 
+    # ------------------------------------------------------- pause / resume
+    #: attributes that carry over from one round to the next (e.g. FedMatch's helper bank,
+    #: FedTriNet's local models). They go into the run's checkpoint, so a paused run resumes
+    #: exactly where it stopped. Everything else is rebuilt from the config.
+    persistent_state: Tuple[str, ...] = ()
+
+    def state_dict(self) -> Dict[str, object]:
+        return {k: getattr(self, k) for k in self.persistent_state}
+
+    def load_state_dict(self, state: Dict[str, object]) -> None:
+        for k in self.persistent_state:
+            if k in state:
+                setattr(self, k, state[k])
+
     def compute_loss(self, model: nn.Module, labeled: Optional[Tuple], unlabeled: Optional[Tuple]
                      ) -> Tuple[torch.Tensor, Dict[str, float]]:
         raise NotImplementedError
