@@ -207,7 +207,8 @@ class Strategy:
                  sums: Optional[Dict[str, object]] = None) -> Dict[str, object]:
         """``steps`` SGD steps of ``loss_fn(model, labeled, unlabeled)`` (default
         ``compute_loss``) with a fresh optimiser. Handles precision, the FedProx term
-        and gradient clipping. Logged values are summed into ``sums`` on the device:
+        and gradient clipping. A loss function may return ``(None, logs)`` to skip the
+        update of that step (its logs still count). Logged values are summed into ``sums`` on the device:
         a float() per value per step would make the CPU wait for the GPU every step."""
         loss_fn = loss_fn or self.compute_loss
         model.train()
@@ -228,6 +229,10 @@ class Strategy:
                 torch.compiler.cudagraph_mark_step_begin()
             with torch.autocast(self.device.type, dtype=amp_dtype, enabled=use_amp):
                 loss, logs = loss_fn(fwd, labeled, unlabeled)
+            if loss is None:                      # the loss function skipped this step (no update)
+                for k, v in logs.items():
+                    sums[k] = sums[k] + (v.detach().float() if torch.is_tensor(v) else v)
+                continue
             prox = self.proximal_term(model)
             if prox is not None:
                 loss = loss + prox

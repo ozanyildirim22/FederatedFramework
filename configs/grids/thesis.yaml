@@ -55,7 +55,6 @@ algorithms:
     unsup_epochs: 1
     confidence: variance
     selection: adaptive
-    kl_direction: add
 
 experiments:
   # Cross-device: CIFAR-10, ResNet-34, 100 clients, C = 0.1

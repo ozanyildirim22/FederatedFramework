@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from collections import defaultdict
 from typing import Dict, Optional, Tuple
 
@@ -163,81 +164,95 @@ class UDA(Strategy):
 
 
 # --------------------------------------------------------------------------
+def fedlabel_confidence(logits: torch.Tensor, kind: str = "variance") -> torch.Tensor:
+    """FedLabel's confidence h(.) >= 0 (as in the test1 implementation). The logits are
+    clamped to [-40, 40] first.
+
+    * ``variance`` - variance of the logit vector (ADD / paper).
+    * ``entropy``  - log(K) - entropy of the softmax distribution.
+    * ``max_prob`` - highest softmax probability.
+    """
+    safe = logits.float().clamp(-40.0, 40.0)
+    if kind == "variance":
+        return safe.var(dim=-1, unbiased=False)
+    probs = F.softmax(safe, dim=-1)
+    if kind == "entropy":
+        ent = -(probs * probs.clamp_min(1e-8).log()).sum(dim=-1)
+        return (math.log(max(safe.size(-1), 2)) - ent).clamp_min(0.0)
+    if kind == "max_prob":
+        return probs.max(dim=-1)[0]
+    raise ValueError(f"Unknown confidence metric '{kind}' (variance | entropy | max_prob)")
+
+
 @STRATEGIES.register("fedlabel")
 class FedLabel(Strategy):
-    """FedLabel (Cho et al., ICCV 2023), as specified in the project ADD (Section 3.1,
-    Algorithm 2). Each client round has two updates that both start from W_t:
+    """FedLabel (Cho et al., ICCV 2023). The client algorithm is the one of the ``test1``
+    implementation (``fedlabel/client.py``); the data (partition, labeled / unlabeled split,
+    weak and strong views, batch sizes) comes from the framework's own preprocessing.
 
-    **Step 1 - supervised local update.** ``w_L = W_t``; tau SGD steps of cross-entropy
-    on the labeled data give the local model ``w_L`` and ``dw_L = w_L - W_t``.
+    **Stage 1 - supervised local update.** ``w_L`` starts from ``W_t`` and takes tau SGD
+    steps of cross-entropy on labeled batches (a batch of one sample, or a non-finite loss,
+    is skipped). ``dw_L = w_L - W_t``.
 
-    **Step 2 - confidence-based model selection.** For every unlabeled sample both the
-    frozen global model ``W_t`` and the frozen local model ``w_L`` give logits on the weak
-    view. ``h(.)`` (``confidence``; default: variance of the logits) scores them; the more
-    confident one (ties go to the global model) is the pseudo-labeller ``s*``, the other is
-    ``s_bar``. The hard label ``argmax s*`` is kept if ``max softmax(s*) >= beta`` and then
-    trained on the strong view with cross-entropy.
+    **Stage 2 - semi-supervised update.** ``w_U`` starts again from ``W_t``. For each of the
+    tau' unlabeled batches the frozen global model ``W_t`` and the frozen local model ``w_L``
+    give logits on the weak view and are scored with ``h(.)`` (``confidence``). The global
+    model is the pseudo-labeller ``s*`` only if it is strictly more confident
+    (``h(s_G) > h(s_L)``, ties go to the local model); the other is ``s_bar``. Samples with
+    ``max softmax(s*) > beta`` are kept. If fewer than two samples are kept, the step is
+    skipped (no update). Otherwise ``w_U`` sees only the kept samples' strong view:
 
-    **Step 3 - global-local consistency.** For kept samples where ``argmax s_bar`` gives the
-    same label, a KL term pulls the training model's weak-view output towards ``s_bar``,
-    weighted by ``lambda_k = lambda0 * h(s_bar) / h(s*)``.
+        loss = lambda_u * CE(w_U(strong), y_hat)                    (mean over kept samples)
+             + mean over kept samples with argmax s_bar = y_hat of
+               lambda_k * KL(softmax(s_bar) || softmax(w_U(strong)))
 
-    The semi-supervised model ``w_U`` starts again from ``W_t`` and takes tau' SGD steps on
+    with ``lambda_k = lambda0 * clamp(h(s_bar) / h(s*), 0, 1)``.
 
-        F_U = mean over the unlabeled batch of
-              [ lambda_u * CE(w_U, strong(xi), y_hat) + lambda_k * KL(.) * 1[argmax s_bar = y_hat] ] * 1[kept]
-
-    and ``dw_U = w_U - W_t``. The client sends ``dw = dw_L + dw_U`` (Eq. 4); the server's
-    weighted average of ``W_t + dw_k`` is Eq. 5.
+    **Stage 3 - merging.** Parameters: ``dw = dw_L + dw_U``. Floating-point buffers (BatchNorm
+    running statistics): the mean of the two deltas if ``w_U`` was updated, else ``dw_L``.
+    Integer buffers keep the value of ``W_t``. Aggregation weight
+    ``r_k = |labeled set| + number of kept unlabeled samples`` (``weight_by_used``).
 
     Parameters
     ----------
-    beta          pseudo-label threshold (ADD: beta). Default 0.5: the paper's appendix A (Fig. 10)
-                  finds 0.3-0.5 best and 0.9 the worst (strong augmentation lowers the confidence).
-    lambda0       global scale of the consistency weight (ADD: lambda_0).
-    lambda_u      weight of the pseudo-label cross-entropy (1 in the ADD).
-    sup_steps     tau: SGD steps on labeled data in Step 1 (the paper counts tau in local
-                  iterations; its ablation found tau = 5 the worst). If unset, ``sup_epochs``.
-    unsup_steps   tau': SGD steps on unlabeled data in Steps 2-3. If unset, ``unsup_epochs``.
+    beta          pseudo-label threshold (strict ``>``).
+    lambda0       upper bound of the consistency weight lambda_k.
+    lambda_u      weight of the pseudo-label cross-entropy (1 in test1).
+    sup_steps     tau: SGD steps on labeled data. If unset, ``sup_epochs``.
+    unsup_steps   tau': unlabeled batches. If unset, ``unsup_epochs``.
     sup_epochs    epochs over the labeled data when ``sup_steps`` is unset; default ``strategy.local_epochs``.
     unsup_epochs  epochs over the unlabeled data when ``unsup_steps`` is unset; default ``strategy.local_epochs``.
                   ``strategy.local_steps``, if set and no ``*_steps`` is given, gives both phases that many steps.
-    weight_by_used  aggregation weight r_k = samples used this round (labeled samples processed +
-                  unlabeled samples that passed the threshold), as in the paper's Alg. 1; False =
-                  the server's ``weight_by`` (dataset size).
-    confidence    h(.): ``variance`` (logits, ADD) | ``prob_variance`` | ``max_prob`` | ``entropy``.
+    weight_by_used  r_k as above; False = the server's ``weight_by`` (dataset size).
+    confidence    h(.): ``variance`` | ``entropy`` | ``max_prob`` (see :func:`fedlabel_confidence`).
     selection     ``adaptive`` (FedLabel) | ``local`` | ``global`` (ablations: always one model).
-    kl_direction  ``add``: KL(s(w_U) || s_bar) exactly as written in the ADD (Eq. 2);
-                  ``teacher``: KL(s_bar || s(w_U)), the usual distillation direction.
 
-    The names used before this version (``tau``, ``lambda_kl``, ``local_warmup_steps``) are
-    still accepted, so older configs keep loading.
+    Older parameter names (``tau``, ``lambda_kl``) are still accepted; ``kl_direction``,
+    ``local_warmup_steps`` and ``temperature`` are ignored.
     """
 
     needs_global_model = True
     param_aliases = {"tau": "beta", "lambda_kl": "lambda0"}            # names before the ADD alignment
-    retired_params = ("local_warmup_steps", "temperature")
+    retired_params = ("local_warmup_steps", "temperature", "kl_direction")
 
     def __init__(self, cfg, num_classes, beta: float = 0.5, lambda0: float = 1.0, lambda_u: float = 1.0,
                  sup_epochs: Optional[int] = None, unsup_epochs: Optional[int] = None,
-                 confidence: str = "variance", selection: str = "adaptive", kl_direction: str = "add",
+                 confidence: str = "variance", selection: str = "adaptive",
                  sup_steps: Optional[int] = None, unsup_steps: Optional[int] = None,
                  weight_by_used: bool = True, **params):
         beta = params.pop("tau", beta)                       # older configs
         lambda0 = params.pop("lambda_kl", lambda0)
-        for old in ("local_warmup_steps", "temperature"):
+        for old in self.retired_params:
             params.pop(old, None)
         super().__init__(cfg, num_classes, **params)
         if selection not in ("adaptive", "local", "global"):
             raise ValueError(f"Unknown selection '{selection}'")
-        if kl_direction not in ("add", "teacher"):
-            raise ValueError(f"Unknown kl_direction '{kl_direction}'")
-        confidence_score(torch.zeros(1, 2), confidence)      # validates the name
+        fedlabel_confidence(torch.zeros(1, 2), confidence)   # validates the name
         self.beta, self.lambda0, self.lambda_u = float(beta), float(lambda0), float(lambda_u)
         self.sup_epochs, self.unsup_epochs = sup_epochs, unsup_epochs
         self.sup_steps, self.unsup_steps = sup_steps, unsup_steps
         self.weight_by_used = bool(weight_by_used)
-        self.confidence, self.selection, self.kl_direction = confidence, selection, kl_direction
+        self.confidence, self.selection = confidence, selection
         self.local_model: Optional[torch.nn.Module] = None
 
     # ------------------------------------------------------------ steps
@@ -257,46 +272,66 @@ class FedLabel(Strategy):
     # ------------------------------------------------------------ losses
     def _sup_loss(self, model, labeled, _):
         x, y = labeled
-        loss = supervised_ce(model(x), y)
+        if x.size(0) <= 1:
+            return None, {}
+        loss = F.cross_entropy(model(x), y.long().view(-1))
+        if not torch.isfinite(loss):
+            return None, {}
         return loss, {"loss_sup": loss.detach()}
 
     def _unsup_loss(self, model, _, unlabeled):
         u_w, u_s, u_true = unlabeled
-        lw, ls = model(torch.cat([u_w, u_s])).split([len(u_w), len(u_s)])
+        zero = u_w.new_zeros(())
+        logs = {"loss_unsup": zero, "loss_kl": zero, "mask_rate": zero, "local_selected": zero,
+                "kl_rate": zero, "lambda_k": zero, "_pl_correct": zero, "_pl_count": zero,
+                "_used_unlabeled": zero}
+        if u_w.size(0) <= 1:
+            return None, logs
         with torch.no_grad():
             s_g, s_l = self.global_model(u_w).float(), self.local_model(u_w).float()
-            h_g, h_l = confidence_score(s_g, self.confidence), confidence_score(s_l, self.confidence)
+            if not (torch.isfinite(s_g).all() and torch.isfinite(s_l).all()):
+                return None, logs
+            h_g = fedlabel_confidence(s_g, self.confidence)
+            h_l = fedlabel_confidence(s_l, self.confidence)
             if self.selection == "local":
-                use_local = torch.ones_like(h_l, dtype=torch.bool)
+                g_better = torch.zeros_like(h_g, dtype=torch.bool)
             elif self.selection == "global":
-                use_local = torch.zeros_like(h_l, dtype=torch.bool)
-            else:                                            # Alg. 2: if h(s_G) >= h(s_L) -> global
-                use_local = h_l > h_g
-            s_sel = torch.where(use_local[:, None], s_l, s_g)
-            s_bar = torch.where(use_local[:, None], s_g, s_l)
-            h_sel = torch.where(use_local, h_l, h_g)
-            h_bar = torch.where(use_local, h_g, h_l)
-            conf, pseudo = F.softmax(s_sel, dim=1).max(dim=1)
-            kept = conf > self.beta                          # Eq. 4: max s*(xi) > beta (strict)
-            agree = kept & (s_bar.argmax(dim=1) == pseudo)
-            # lambda_k = lambda0 * h(s_bar) / h(s*); <= lambda0 when s* is the more confident
-            # one (adaptive); capped there for the forced local / global ablations
-            lam = self.lambda0 * (h_bar / h_sel.clamp_min(1e-12)).clamp(max=1.0)
-            weight = lam * agree.float()
-        ce = masked_ce(ls, pseudo, kept)
-        log_p_u = F.log_softmax(lw.float(), dim=1)
-        log_p_bar = F.log_softmax(s_bar, dim=1)
-        if self.kl_direction == "add":                       # KL(s(w_U) || s_bar)
-            kl_each = (log_p_u.exp() * (log_p_u - log_p_bar)).sum(dim=1)
-        else:                                                # KL(s_bar || s(w_U))
-            kl_each = (log_p_bar.exp() * (log_p_bar - log_p_u)).sum(dim=1)
-        kl = (kl_each * weight).mean()                       # averaged over the whole batch (Eq. 3)
-        loss = self.lambda_u * ce + kl
-        logs = {"loss_unsup": ce.detach(), "loss_kl": kl.detach(),
-                "local_selected": use_local.float().mean(), "kl_rate": agree.float().mean(),
-                "lambda_k": (lam * agree).sum() / agree.sum().clamp_min(1)}
-        logs.update(_pl_stats(pseudo, kept, u_true))
-        logs["_used_unlabeled"] = kept.float().sum()          # for the aggregation weight r_k
+                g_better = torch.ones_like(h_g, dtype=torch.bool)
+            else:                                            # test1: global only if strictly more confident
+                g_better = h_g > h_l
+            s_sel = torch.where(g_better[:, None], s_g, s_l)
+            s_bar = torch.where(g_better[:, None], s_l, s_g)
+            h_sel = torch.where(g_better, h_g, h_l)
+            h_bar = torch.where(g_better, h_l, h_g)
+            max_probs, pseudo = F.softmax(s_sel, dim=-1).max(dim=-1)
+            kept = max_probs > self.beta
+            logs.update(mask_rate=kept.float().mean(), local_selected=(~g_better).float().mean(),
+                        _pl_correct=((pseudo == u_true) & kept).float().sum(), _pl_count=kept.float().sum())
+        n_kept = int(kept.sum())
+        if n_kept <= 1:                                      # test1: too few samples -> no update
+            return None, logs
+
+        pseudo_k, s_bar_k = pseudo[kept], s_bar[kept]
+        logits_u = model(u_s[kept]).float()                  # strong view of the kept samples only
+        loss_ce = F.cross_entropy(logits_u, pseudo_k)
+
+        agree = s_bar_k.argmax(dim=-1) == pseudo_k
+        loss_kl, lam_mean = zero, zero
+        if agree.any():
+            log_p_u = F.log_softmax(logits_u[agree], dim=-1)
+            log_p_bar = F.log_softmax(s_bar_k[agree], dim=-1)
+            ratio = h_bar[kept][agree] / h_sel[kept][agree].clamp_min(1e-6)
+            lam = self.lambda0 * ratio.clamp(0.0, 1.0)
+            kl_each = F.kl_div(log_p_u, log_p_bar, reduction="none", log_target=True).sum(dim=-1)
+            loss_kl = (lam * kl_each).mean()
+            lam_mean = lam.mean()
+        loss = self.lambda_u * loss_ce + loss_kl
+        if not torch.isfinite(loss):
+            return None, logs
+        logs.update(loss_unsup=loss_ce.detach(), loss_kl=loss_kl.detach(),
+                    kl_rate=agree.float().sum() / max(1, u_w.size(0)), lambda_k=lam_mean.detach(),
+                    _used_unlabeled=float(n_kept))
+        self._unlabeled_updated = True
         return loss, logs
 
     # ------------------------------------------------------------ round
@@ -310,7 +345,7 @@ class FedLabel(Strategy):
         self.total_steps = tau + tau_u
         sums: Dict[str, object] = defaultdict(float)
 
-        # Step 1: supervised local update w_L (tau steps from W_t)
+        # Stage 1: supervised local update w_L (tau steps from W_t)
         if tau:
             self.optimize(model, tau, round_batches(lab, tau), None, self._sup_loss, sums)
         after_l = {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -318,23 +353,38 @@ class FedLabel(Strategy):
         for p in self.local_model.parameters():
             p.requires_grad_(False)
 
-        # Steps 2-3: semi-supervised update w_U (tau' steps, again from W_t)
+        # Stage 2: semi-supervised update w_U (tau' unlabeled batches, again from W_t)
         model.load_state_dict(start)
+        self._unlabeled_updated = False
         if tau_u:
             self.optimize(model, tau_u, None, round_batches(unl, tau_u), self._unsup_loss, sums)
-        after_u = model.state_dict()
+        after_u = {k: v.detach() for k, v in model.state_dict().items()}
 
-        # Eq. 4: dw = dw_L + dw_U  ->  the model sent back is W_t + dw_L + dw_U
-        model.load_state_dict({k: (v0 + (after_l[k] - v0) + (after_u[k] - v0)) if v0.is_floating_point()
-                               else after_u[k] for k, v0 in start.items()})
+        # Stage 3: merge. Parameters dw_L + dw_U; float buffers averaged (keeps BatchNorm
+        # running_var positive) if w_U was updated, else dw_L; integer buffers stay at W_t.
+        param_keys = {k for k, _ in model.named_parameters()}
+        merged = {}
+        for k, v0 in start.items():
+            if not v0.is_floating_point():
+                merged[k] = v0
+                continue
+            d_l, d_u = after_l[k] - v0, after_u[k] - v0
+            if k in param_keys:
+                d = d_l + d_u
+            elif self._unlabeled_updated:
+                d = 0.5 * (d_l + d_u)
+            else:
+                d = d_l
+            merged[k] = v0 + torch.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
+        model.load_state_dict(merged)
         self.on_round_end(model, client)
         self.global_model, self.local_model, self._global_params = None, None, None
-        # Alg. 1, line 8: r_k = number of samples used for dw_L and dw_U this round (labeled
-        # samples processed + unlabeled samples that passed the threshold)
+
+        # r_k = labeled samples of the client + unlabeled samples that passed the threshold
         used_u = float(sums.pop("_used_unlabeled", 0.0))
-        used_l = float(tau * lab.batch_size) if tau else 0.0
+        used_l = float(len(lab.dataset)) if lab is not None else 0.0
         if self.weight_by_used:
-            self.aggregation_weight = used_l + used_u
+            self.aggregation_weight = max(1.0, used_l + used_u)
         metrics = self.summarize(sums, {"loss_sup": tau, "loss_prox": tau + tau_u, "": tau_u})
         metrics["used_samples"] = used_l + used_u
         metrics["loss"] = metrics.get("loss_sup", 0.0) + metrics.get("loss_unsup", 0.0) + metrics.get("loss_kl", 0.0)

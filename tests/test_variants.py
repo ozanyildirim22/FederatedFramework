@@ -420,16 +420,15 @@ def test_thesis_grid_follows_add():
 
 # ------------------------------------------------------------- FedLabel paper alignment
 def test_fedlabel_aggregation_weight_is_samples_used(tmp_path):
-    """Paper Alg. 1: r_k = labeled samples processed + unlabeled samples past the threshold."""
+    """test1 client: r_k = size of the labeled set + unlabeled samples past the threshold."""
     from ssfl.client import ClientUpdate
     exp = Experiment(cfg_for(tmp_path, **{"strategy.name": "fedlabel", "strategy.params":
                                           {"beta": 0.0, "sup_steps": 2, "unsup_steps": 3}}), verbose=False)
     client = exp.clients[0]
     upd: ClientUpdate = client.fit(exp.model, exp.server.broadcast(), exp.strategy, torch.device("cpu"))
-    lab_bs = client.data.labeled.batch_size
     assert upd.metrics["used_samples"] == upd.num_samples
-    assert upd.num_samples >= 2 * lab_bs                           # tau = 2 labeled steps counted
-    assert upd.num_samples <= 2 * lab_bs + 3 * client.data.unlabeled.batch_size
+    # beta = 0 keeps every unlabeled sample: 3 full unlabeled batches
+    assert upd.num_samples == client.data.num_labeled + 3 * client.data.unlabeled.batch_size
     exp2 = Experiment(cfg_for(tmp_path, **{"strategy.name": "fedlabel",
                                            "strategy.params": {"weight_by_used": False}}), verbose=False)
     upd2 = exp2.clients[0].fit(exp2.model, exp2.server.broadcast(), exp2.strategy, torch.device("cpu"))
@@ -694,3 +693,53 @@ def test_compile_mode_names():
     assert compile_mode(NS(compile="reduce-overhead")) == "reduce-overhead"
     with pytest.raises(ValueError):
         compile_mode(NS(compile="fast"))
+
+
+# ------------------------------------------------------------- clearing previous runs
+def _fake_run(root, name, status=None, algo="fedlabel"):
+    import json
+    d = root / name
+    d.mkdir(parents=True)
+    (d / "config.yaml").write_text(f"strategy:\n  name: {algo}\n", encoding="utf-8")
+    (d / "metrics.csv").write_text("round,test_acc\n1,0.5\n", encoding="utf-8")
+    if status:
+        (d / "summary.json").write_text(json.dumps({"status": status}), encoding="utf-8")
+    return d
+
+
+def test_clear_runs_select_and_delete(tmp_path):
+    from ssfl.cleanup import delete_runs, select_runs
+    _fake_run(tmp_path, "a_fedlabel_20261101-000000", "finished")
+    _fake_run(tmp_path, "b_fedavg_20261101-000000", "finished", algo="fedavg")
+    _fake_run(tmp_path, "c_fedlabel_20261101-000000", "stopped")
+    _fake_run(tmp_path, "d_fedlabel_20261101-000000")                      # no summary: partial
+    _fake_run(tmp_path, "e_fedlabel_20261101-000000", "running")           # fresh: still running
+    (tmp_path / "notes").mkdir()                                           # not a run folder
+    names = lambda ps: sorted(p.name[0] for p in ps)                      # noqa: E731
+    assert names(select_runs(tmp_path)) == list("abcde")
+    assert names(select_runs(tmp_path, algorithms=["fedavg"])) == ["b"]
+    assert names(select_runs(tmp_path, statuses=["unfinished"])) == ["c", "d"]
+    assert names(select_runs(tmp_path, only=["fedlabel"], statuses=["finished"])) == ["a"]
+    with pytest.raises(ValueError):
+        select_runs(tmp_path, statuses=["bogus"])
+
+    deleted, skipped = delete_runs(tmp_path, ["a_fedlabel_20261101-000000", "e_fedlabel_20261101-000000",
+                                              "notes", "../x", "missing"])
+    assert deleted == ["a_fedlabel_20261101-000000"]
+    assert set(skipped) == {"e_fedlabel_20261101-000000", "notes", "../x", "missing"}
+    assert "running" in skipped["e_fedlabel_20261101-000000"]
+    assert not (tmp_path / "a_fedlabel_20261101-000000").exists()
+    assert (tmp_path / "e_fedlabel_20261101-000000").exists() and (tmp_path / "notes").exists()
+
+
+def test_clear_runs_cli(tmp_path, monkeypatch):
+    from ssfl.__main__ import main
+    _fake_run(tmp_path, "a_fedlabel_20261101-000000", "finished")
+    _fake_run(tmp_path, "b_fedavg_20261101-000000", "finished", algo="fedavg")
+    main(["--clear-runs", "--runs-dir", str(tmp_path), "--dry-run"])        # lists only
+    assert len(list(tmp_path.iterdir())) == 2
+    monkeypatch.setattr("builtins.input", lambda _: "n")
+    main(["--clear-runs", "--runs-dir", str(tmp_path)])                      # answered no
+    assert len(list(tmp_path.iterdir())) == 2
+    main(["--clear-runs", "--runs-dir", str(tmp_path), "--algorithm", "fedlabel", "--yes"])
+    assert [p.name for p in tmp_path.iterdir()] == ["b_fedavg_20261101-000000"]

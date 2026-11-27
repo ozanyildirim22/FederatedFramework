@@ -26,7 +26,6 @@ strategy:
     unsup_epochs: 1           # tau': epochs on unlabeled data (Steps 2-3)
     confidence: variance      # h(.) = variance of the logits
     selection: adaptive       # adaptive | local | global (ablations)
-    kl_direction: add         # add = KL(s(w_U) || s_bar) as in Eq. 2 | teacher
 server:
   aggregator: fedavg
   rounds: 1000               # ADD Table 2: 1,000 communication rounds

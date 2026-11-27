@@ -94,10 +94,8 @@ PARAM_HELP: Dict[str, Tuple[str, Optional[List[str]]]] = {
     "lambda0": ("λ₀: scale of the global–local consistency weight", None),
     "sup_epochs": ("τ: epochs on labeled data (Step 1); empty = local epochs", None),
     "unsup_epochs": ("τ′: epochs on unlabeled data (Steps 2–3); empty = local epochs", None),
-    "kl_direction": ("add = KL(s(w_U) ‖ s̄) as in the ADD's Eq. 2; teacher = KL(s̄ ‖ s(w_U))",
-                     ["add", "teacher"]),
-    "confidence": ("h(·): variance of the logits (ADD), of the probabilities, max probability or exp(−entropy)",
-                   ["variance", "prob_variance", "max_prob", "entropy"]),
+    "confidence": ("h(·): variance of the logits (ADD), log K − entropy, or max probability",
+                   ["variance", "entropy", "max_prob"]),
     "selection": ("Pseudo-label source: adaptive = FedLabel, local/global = ablations",
                   ["adaptive", "local", "global"]),
     "mu": ("Proximal coefficient μ", None),
@@ -941,6 +939,16 @@ def board_order(runs: List[Dict[str, Any]]) -> List[str]:
     return [r["run"] for r in sorted(runs, key=lambda r: (r["best_acc"] is None, -(r["best_acc"] or 0)))]
 
 
+def clear_choices(runs_dir: str) -> List[Tuple[str, str]]:
+    """Every run folder (also ones without metrics yet) for the Clear runs picker, newest first."""
+    from .cleanup import list_run_dirs, run_status
+    out = []
+    for p in list_run_dirs(runs_dir):
+        st = run_status(p)
+        out.append((f"{p.name} · {STATUS_LABEL.get(st, st)}", p.name))
+    return out
+
+
 def run_choices(runs: List[Dict[str, Any]]) -> List[Tuple[str, str]]:
     return [(f"{r['base']} · {r['started']} · best {_pct(r['best_acc'])}%", r["run"]) for r in runs]
 
@@ -1361,6 +1369,8 @@ footer { display:none !important; }
 /* algorithm info */
 .algo-info { display:grid; grid-template-columns: repeat(auto-fill, minmax(240px,1fr)); gap:10px; }
 .algo-info.empty { display:block; opacity:.75; font-size:13.5px; padding:4px 2px; }
+.clear-note { font-size:13.5px; padding:4px 2px; line-height:1.5; }
+.clear-note ul { margin:6px 0 0 18px; }
 .algo-card { border-radius:14px; padding:12px 14px; border:1px solid var(--border-color-primary);
   background:var(--block-background-fill); position:relative; overflow:hidden; }
 .algo-card::before { content:""; position:absolute; left:0; top:0; bottom:0; width:4px; background:var(--ss-a); }
@@ -1799,6 +1809,22 @@ def build_app():
                             dl_csv = gr.DownloadButton("⬇  Leaderboard CSV", value=None)
                             dl_tex = gr.DownloadButton("⬇  Thesis table LaTeX", value=None)
                         latex_view = gr.Code("", language="latex", label="LaTeX", lines=12)
+                    with gr.Tab("🗑️  Clear runs", id="clear"):
+                        gr.Markdown("Delete previous run folders from the runs folder above. Deleting is "
+                                    "**permanent**. A run that is still running is never deleted. The "
+                                    "grid runs a deleted run again the next time.", elem_classes="muted")
+                        clear_pick = gr.Dropdown([], value=[], multiselect=True, label="Runs to delete",
+                                                 info="newest first")
+                        with gr.Row():
+                            clear_shown_btn = gr.Button("Select runs in the leaderboard (filters)", size="sm")
+                            clear_unfin_btn = gr.Button("Select unfinished", size="sm")
+                            clear_all_btn = gr.Button("Select all", size="sm")
+                            clear_none_btn = gr.Button("Clear selection", size="sm")
+                        clear_btn = gr.Button("🗑️  Delete selected runs", variant="stop")
+                        clear_msg = gr.HTML("")
+                        with gr.Row(visible=False) as clear_confirm_row:
+                            clear_yes = gr.Button("Yes, delete permanently", variant="stop")
+                            clear_no = gr.Button("Cancel")
 
             # ======================================================== GUIDE
             with gr.Tab("📘 Guide", id="guide"):
@@ -2181,11 +2207,52 @@ def build_app():
                     gr.update(choices=names, value=chosen), board_df, thesis_display(thesis_df),
                     str(csv_path), str(tex_path), latex, kp, plot_update(run_curves(d, chosen, metric_key),
                                                                  y_title=METRIC_LABELS.get(metric_key, metric_key)),
-                    board_order(sel), gr.update(choices=run_choices(sel)))
+                    board_order(sel), gr.update(choices=run_choices(sel)),
+                    gr.update(choices=clear_choices(d)))
 
         res_inputs = [runs_dir, f_dataset, f_algo, metric, thesis_value]
         res_outputs = [f_dataset, f_algo, run_select, board, thesis, dl_csv, dl_tex, latex_view, res_kpis,
-                       curve_plot, board_runs, detail_pick]
+                       curve_plot, board_runs, detail_pick, clear_pick]
+
+        # -------------------------------------------------------- clear runs
+        def on_clear_select(kind, d, shown):
+            from .cleanup import list_run_dirs, select_runs
+            if kind == "shown":
+                names = list(shown or [])
+            elif kind == "unfinished":
+                names = [p.name for p in select_runs(d, statuses=["unfinished"])]
+            elif kind == "all":
+                names = [p.name for p in list_run_dirs(d)]
+            else:
+                names = []
+            return gr.update(choices=clear_choices(d), value=names), "", gr.update(visible=False)
+
+        for btn, kind in ((clear_shown_btn, "shown"), (clear_unfin_btn, "unfinished"),
+                          (clear_all_btn, "all"), (clear_none_btn, "none")):
+            btn.click(lambda d, shown, k=kind: on_clear_select(k, d, shown), [runs_dir, board_runs],
+                      [clear_pick, clear_msg, clear_confirm_row])
+
+        def on_clear_ask(picked, d):
+            if not picked:
+                return '<div class="algo-info empty">Select one or more runs first.</div>', gr.update(visible=False)
+            listing = "".join(f"<li><code>{html.escape(n)}</code></li>" for n in picked[:12])
+            more = f"<li>… and {len(picked) - 12} more</li>" if len(picked) > 12 else ""
+            return (f'<div class="clear-note">⚠️ Permanently delete <b>{len(picked)}</b> run folder(s) from '
+                    f'<code>{html.escape(str(Path(d).resolve()))}</code>? This cannot be undone.'
+                    f'<ul>{listing}{more}</ul></div>', gr.update(visible=True))
+
+        def on_clear_confirm(picked, d):
+            from .cleanup import delete_runs
+            deleted, skipped = delete_runs(d, picked or [])
+            kept = "".join(f"<li><code>{html.escape(n)}</code>: {html.escape(why)}</li>" for n, why in skipped.items())
+            msg = (f'<div class="clear-note">Deleted <b>{len(deleted)}</b> run folder(s).'
+                   + (f" Kept {len(skipped)}:<ul>{kept}</ul>" if skipped else "") + "</div>")
+            return gr.update(choices=clear_choices(d), value=[]), msg, gr.update(visible=False)
+
+        clear_btn.click(on_clear_ask, [clear_pick, runs_dir], [clear_msg, clear_confirm_row])
+        clear_no.click(lambda: ("", gr.update(visible=False)), None, [clear_msg, clear_confirm_row])
+        clear_yes.click(on_clear_confirm, [clear_pick, runs_dir], [clear_pick, clear_msg, clear_confirm_row]).then(
+            on_results, res_inputs, res_outputs)
 
         # ------------------------------------------------------- run details
         detail_outputs = [detail_html, detail_acc, detail_loss, dl_run_cfg, dl_run_metrics, dl_run_summary]

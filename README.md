@@ -114,6 +114,17 @@ python -m ssfl --grid configs/grids/thesis.yaml --set output_dir=/content/drive/
 A run whose `runs/<name>_*/summary.json` already exists is skipped, so an interrupted grid
 continues where it stopped (`--no-resume` runs everything again).
 
+To clear previous runs (e.g. after an algorithm change), delete their folders. The command lists the
+matching runs and asks first; a run that is still running is never deleted. The GUI has the same
+option under **Results → 🗑️ Clear runs**.
+
+```bash
+python -m ssfl --clear-runs --dry-run                                # list every run folder in ./runs
+python -m ssfl --clear-runs --algorithm fedlabel                     # all FedLabel runs
+python -m ssfl --clear-runs --status unfinished --yes                # stopped / error / interrupted / partial, no prompt
+python -m ssfl --clear-runs --runs-dir /content/drive/MyDrive/ssfl/runs --only organamnist
+```
+
 Or from Python:
 
 ```python
@@ -143,7 +154,7 @@ buttons and **Load these settings into Experiment**.
 | `fedprox` | FedProx (Li et al., 2020): FedAvg + proximal term `mu/2·‖w − W_t‖²` (`mu`, default 0.01). |
 | `fedmatch` | FedMatch (Jeong et al., ICLR 2021): weights `sigma + psi`; `sigma` learns from labeled data, `psi` from unlabeled data. Pseudo-labels come from a vote of the local model and `num_helpers` helper models chosen by the server (nearest neighbours of a model embedding), enforced on the strong view, + inter-client KL consistency and L1/L2 terms on `psi`. Params: `tau`, `lambda_s`, `lambda_iccs`, `lambda_l1`, `lambda_l2`, `num_helpers`, `helper_every`, `decompose`. |
 | `fedtrinet` | FedTriNet (Che et al., 2021): `pretrain_rounds` of FedAvg on labeled data, then three players — the client's previous local model, the global model and a combined model (global shallow layers + local deep layers) — average their softmax outputs to give pseudo-labels. These are kept above a dynamic threshold `theta(t)`: clients upload `max p_G`, the server averages it, and the threshold decays with the paper's schedule (`alpha`=0.93). Params: `pretrain_rounds`, `alpha`, `lambda_u`, `finetune_steps`, `global_layers`, `unsup_view`. |
-| `fedlabel` | FedLabel (Cho et al., ICCV 2023) as in the ADD (Section 3.1, Algorithm 2). **Step 1:** τ epochs (`sup_epochs`) of supervised training from W_t give the local model w_L. **Step 2:** a new model w_U, again from W_t, trains τ′ epochs (`unsup_epochs`) on unlabeled data: per sample, the global and local model are scored with h(·) = variance of the logits (`confidence`); the more confident one gives the hard pseudo-label if its top probability ≥ β (`beta`), trained on the strong view. **Step 3:** where the other model predicts the same class, a KL term (`kl_direction`) weighted by λ_k = λ₀·h(s̄)/h(s*) (`lambda0`). The client uploads Δw_L + Δw_U, and the server weights it by r_k = samples used that round (paper's Alg. 1; `weight_by_used`). τ / τ′ can also be given in SGD steps (`sup_steps`, `unsup_steps`), as in the paper. `selection: local\|global` and `confidence` give the ablations. |
+| `fedlabel` | FedLabel (Cho et al., ICCV 2023); client algorithm from the `test1` implementation, data from the framework's preprocessing. **Stage 1:** τ steps (`sup_steps`, or `sup_epochs`) of supervised training from W_t give the local model w_L. **Stage 2:** a new model w_U, again from W_t, takes τ′ unlabeled steps (`unsup_steps` / `unsup_epochs`): per sample, the global and local model are scored on the weak view with h(·) (`confidence`: variance of the logits, log K − entropy, or max probability); the global model gives the hard pseudo-label only if strictly more confident (ties → local), kept if its top probability > β (`beta`). w_U trains on the kept samples' strong view only (a step with fewer than two kept samples is skipped): cross-entropy plus, where the other model predicts the same class, λ_k·KL(s̄ ‖ s(w_U)) with λ_k = λ₀·min(1, h(s̄)/h(s*)) (`lambda0`), both averaged over the samples they apply to. **Stage 3:** the client uploads Δw_L + Δw_U for parameters, the mean of the two for BatchNorm statistics; the server weights it by r_k = labeled set size + kept unlabeled samples (`weight_by_used`). `selection: local\|global` and `confidence` give the ablations. |
 | `pseudolabel` | Hard pseudo-labels above threshold `tau` (Lee, 2013). |
 | `fixmatch` | Weak-view pseudo-label enforced on strong view (FedAvg+FixMatch; with `strategy.prox_mu` FedProx+FixMatch). |
 | `uda` | UDA (Xie et al., 2020): sharpened weak-view prediction (T = 0.4, confidence mask 0.8) is the KL target for the strong view (FedAvg+UDA; with `strategy.prox_mu` FedProx+UDA). |
